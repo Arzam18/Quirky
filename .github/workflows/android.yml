@@ -25,14 +25,13 @@ jobs:
         run: |
           curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o src/sse2neon.h
 
-      - name: Patch SIMN/AVX Code and CMake Flags
+      - name: Patch SIMD/AVX Code and CMake Flags
         run: |
           # 1. Patch CMakeLists.txt to remove -Werror and x86 flags, and enforce NO_AVX2=ON
           python3 -c '
           with open("CMakeLists.txt", "r") as f:
               text = f.read()
 
-          # Remove -Werror so sse2neon unused parameter warnings do not crash the build
           text = text.replace("-Werror", "")
           text = text.replace("-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt", "-O3")
           text = text.replace("-mavx -mavx2 -mbmi -mbmi2", "")
@@ -41,7 +40,7 @@ jobs:
               f.write(text)
           '
 
-          # 2. Patch source headers to include sse2neon and handle AVX2 types if needed
+          # 2. Patch source headers to include sse2neon
           python3 -c '
           import os
 
@@ -66,15 +65,13 @@ jobs:
                       patch_file(os.path.join(root, file))
           '
 
-          # 3. Handle __m256i references in layers.h when AVX2 is disabled
+          # 3. Handle __m256i references in layers.h when AVX2 is disabled (with os imported!)
           python3 -c '
+          import os
           layers_path = "src/eval/layers.h"
           if os.path.exists(layers_path):
               with open(layers_path, "r") as f:
                   code = f.read()
-              # If layers.h uses __m256i assuming AVX2, add a fallback or map it
-              code = "#include \"../sse2neon.h\"\n#inputType __m256i __m128i\n" + code
-              # Better yet, let us replace __m256i usage or define a dummy/fallback type if NO_AVX2
               code = code.replace("__m256i", "__m128i")
               with open(layers_path, "w") as f:
                   f.write(code)
