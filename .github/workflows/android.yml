@@ -92,7 +92,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DNO_AVX2=ON
 
-          cmake --build . --config Release -j$(nproc)
+          # Run sequentially with verbose output to catch the exact error
+          cmake --build . --config Release --verbose
 
           mkdir -p ../dist/bin
           find . -maxdepth 2 -type f -name "Quirky*" -exec cp {} ../dist/bin/Quirky-android-arm64 \;
