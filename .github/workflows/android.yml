@@ -21,9 +21,9 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Download sse2neon Header
+      - name: Download SIMDe (SIMD Everywhere)
         run: |
-          curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o src/sse2neon.h
+          git clone --depth 1 https://github.com/simd-everywhere/simde.git simde
 
       - name: Patch SIMD/AVX Code and CMake Flags
         run: |
@@ -31,9 +31,13 @@ jobs:
           with open("CMakeLists.txt", "r") as f:
               text = f.read()
 
+          # Strip strict x86 flags and warnings
           text = text.replace("-Werror", "")
           text = text.replace("-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt", "-O3")
           text = text.replace("-mavx -mavx2 -mbmi -mbmi2", "")
+          
+          # Add SIMDe to the include path so the compiler finds it
+          text += "\ninclude_directories(${PROJECT_SOURCE_DIR}/simde)\n"
 
           with open("CMakeLists.txt", "w") as f:
               f.write(text)
@@ -48,9 +52,11 @@ jobs:
 
               original = content
 
-              for header in ["<immintrin.h>", "<emmintrin.h>", "<smmintrin.h>", "<nmmintrin.h>", "<tmmintrin.h>", "<xmmintrin.h>"]:
-                  if header in content:
-                      content = content.replace(header, "\"sse2neon.h\"")
+              # Replace standard x86 headers with SIMDe AVX2 headers + Native Aliases
+              headers_to_replace = ["<immintrin.h>", "<emmintrin.h>", "<smmintrin.h>", "<nmmintrin.h>", "<tmmintrin.h>", "<xmmintrin.h>"]
+              for header in headers_to_replace:
+                  if f"#include {header}" in content:
+                      content = content.replace(f"#include {header}", "#define SIMDE_ENABLE_NATIVE_ALIASES\n#include <simde/x86/avx2.h>")
 
               if content != original:
                   with open(path, "w", encoding="utf-8") as f:
@@ -61,18 +67,6 @@ jobs:
               for file in files:
                   if file.endswith((".h", ".hpp", ".cpp", ".c")):
                       patch_file(os.path.join(root, file))
-          '
-
-          python3 -c '
-          import os
-          layers_path = "src/eval/layers.h"
-          if os.path.exists(layers_path):
-              with open(layers_path, "r") as f:
-                  code = f.read()
-              code = code.replace("__m256i", "__m128i")
-              with open(layers_path, "w") as f:
-                  f.write(code)
-              print("Patched layers.h for ARM compatibility")
           '
 
       - name: Build Quirky for Android ARM64 (API 28+)
@@ -92,8 +86,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DNO_AVX2=ON
 
-          # Run sequentially with verbose output to catch the exact error
-          cmake --build . --config Release --verbose
+          # Compile the engine
+          cmake --build . --config Release --verbose -j$(nproc)
 
           mkdir -p ../dist/bin
           find . -maxdepth 2 -type f -name "Quirky*" -exec cp {} ../dist/bin/Quirky-android-arm64 \;
