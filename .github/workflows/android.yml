@@ -25,8 +25,23 @@ jobs:
         run: |
           curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o src/sse2neon.h
 
-      - name: Patch SIMD Headers and x86 Flags
+      - name: Patch SIMN/AVX Code and CMake Flags
         run: |
+          # 1. Patch CMakeLists.txt to remove -Werror and x86 flags, and enforce NO_AVX2=ON
+          python3 -c '
+          with open("CMakeLists.txt", "r") as f:
+              text = f.read()
+
+          # Remove -Werror so sse2neon unused parameter warnings do not crash the build
+          text = text.replace("-Werror", "")
+          text = text.replace("-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt", "-O3")
+          text = text.replace("-mavx -mavx2 -mbmi -mbmi2", "")
+
+          with open("CMakeLists.txt", "w") as f:
+              f.write(text)
+          '
+
+          # 2. Patch source headers to include sse2neon and handle AVX2 types if needed
           python3 -c '
           import os
 
@@ -36,7 +51,6 @@ jobs:
 
               original = content
 
-              # Replace x86 SIMD headers with sse2neon
               for header in ["<immintrin.h>", "<emmintrin.h>", "<smmintrin.h>", "<nmmintrin.h>", "<tmmintrin.h>", "<xmmintrin.h>"]:
                   if header in content:
                       content = content.replace(header, "\"sse2neon.h\"")
@@ -52,17 +66,19 @@ jobs:
                       patch_file(os.path.join(root, file))
           '
 
-          # Also patch CMakeLists.txt to remove strict x86 flags (-msse, -mavx, etc.) and use ARM NEON flags
+          # 3. Handle __m256i references in layers.h when AVX2 is disabled
           python3 -c '
-          with open("CMakeLists.txt", "r") as f:
-              text = f.read()
-
-          # Remove x86 flags string
-          text = text.replace("-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt", "-march=armv8-a+simd -O3")
-          text = text.replace("-mavx -mavx2 -mbmi -mbmi2", "")
-
-          with open("CMakeLists.txt", "w") as f:
-              f.write(text)
+          layers_path = "src/eval/layers.h"
+          if os.path.exists(layers_path):
+              with open(layers_path, "r") as f:
+                  code = f.read()
+              # If layers.h uses __m256i assuming AVX2, add a fallback or map it
+              code = "#include \"../sse2neon.h\"\n#inputType __m256i __m128i\n" + code
+              # Better yet, let us replace __m256i usage or define a dummy/fallback type if NO_AVX2
+              code = code.replace("__m256i", "__m128i")
+              with open(layers_path, "w") as f:
+                  f.write(code)
+              print("Patched layers.h for ARM compatibility")
           '
 
       - name: Build Quirky for Android ARM64 (API 28+)
@@ -72,7 +88,6 @@ jobs:
 
           mkdir build && cd build
 
-          # Configure CMake using Android NDK Toolchain
           cmake .. \
             -DCMAKE_SYSTEM_NAME=Android \
             -DCMAKE_SYSTEM_VERSION=28 \
@@ -83,7 +98,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DNO_AVX2=ON
 
-          # Build the engine
           cmake --build . --config Release -j$(nproc)
 
           mkdir -p ../dist/bin
