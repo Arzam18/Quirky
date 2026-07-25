@@ -36,7 +36,7 @@ jobs:
           text = text.replace("-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt", "-O3")
           text = text.replace("-mavx -mavx2 -mbmi -mbmi2", "")
           
-          # Add SIMDe to the include path so the compiler finds it
+          # Add SIMDe to the include path
           text += "\ninclude_directories(${PROJECT_SOURCE_DIR}/simde)\n"
 
           with open("CMakeLists.txt", "w") as f:
@@ -57,6 +57,12 @@ jobs:
               for header in headers_to_replace:
                   if f"#include {header}" in content:
                       content = content.replace(f"#include {header}", "#define SIMDE_ENABLE_NATIVE_ALIASES\n#include <simde/x86/avx2.h>")
+
+              # Force Unaligned SIMD Loads and Stores to prevent ARM alignment segfaults
+              content = content.replace("_mm256_load_si256", "_mm256_loadu_si256")
+              content = content.replace("_mm256_store_si256", "_mm256_storeu_si256")
+              content = content.replace("_mm_load_si128", "_mm_loadu_si128")
+              content = content.replace("_mm_store_si128", "_mm_storeu_si128")
 
               if content != original:
                   with open(path, "w", encoding="utf-8") as f:
@@ -86,8 +92,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DNO_AVX2=ON
 
-          # Compile the engine
-          cmake --build . --config Release --verbose -j$(nproc)
+          cmake --build . --config Release -j$(nproc)
 
           mkdir -p ../dist/bin
           find . -maxdepth 2 -type f -name "Quirky*" -exec cp {} ../dist/bin/Quirky-android-arm64 \;
