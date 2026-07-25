@@ -1,0 +1,101 @@
+name: Build Quirky for Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Download sse2neon Header
+        run: |
+          curl -sL https://raw.githubusercontent.com/DLTcollab/sse2neon/master/sse2neon.h -o src/sse2neon.h
+
+      - name: Patch SIMD Headers and x86 Flags
+        run: |
+          python3 -c '
+          import os
+
+          def patch_file(path):
+              with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                  content = f.read()
+
+              original = content
+
+              # Replace x86 SIMD headers with sse2neon
+              for header in ["<immintrin.h>", "<emmintrin.h>", "<smmintrin.h>", "<nmmintrin.h>", "<tmmintrin.h>", "<xmmintrin.h>"]:
+                  if header in content:
+                      content = content.replace(header, "\"sse2neon.h\"")
+
+              if content != original:
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(content)
+                  print(f"Patched: {path}")
+
+          for root, dirs, files in os.walk("src"):
+              for file in files:
+                  if file.endswith((".h", ".hpp", ".cpp", ".c")):
+                      patch_file(os.path.join(root, file))
+          '
+
+          # Also patch CMakeLists.txt to remove strict x86 flags (-msse, -mavx, etc.) and use ARM NEON flags
+          python3 -c '
+          with open("CMakeLists.txt", "r") as f:
+              text = f.read()
+
+          # Remove x86 flags string
+          text = text.replace("-msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt", "-march=armv8-a+simd -O3")
+          text = text.replace("-mavx -mavx2 -mbmi -mbmi2", "")
+
+          with open("CMakeLists.txt", "w") as f:
+              f.write(text)
+          '
+
+      - name: Build Quirky for Android ARM64 (API 28+)
+        run: |
+          export NDK_CXX="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
+          export NDK_CC="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
+
+          mkdir build && cd build
+
+          # Configure CMake using Android NDK Toolchain
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_SYSTEM_VERSION=28 \
+            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
+            -DCMAKE_ANDROID_NDK="$ANDROID_NDK_LATEST_HOME" \
+            -DCMAKE_CXX_COMPILER="$NDK_CXX" \
+            -DCMAKE_C_COMPILER="$NDK_CC" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNO_AVX2=ON
+
+          # Build the engine
+          cmake --build . --config Release -j$(nproc)
+
+          mkdir -p ../dist/bin
+          cp Quirky ../dist/bin/Quirky-android-arm64
+
+      - name: Verify Android Binary
+        run: |
+          ls -lh dist/bin/
+          file dist/bin/*
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quirky-android-arm64
+          path: dist/bin/*
