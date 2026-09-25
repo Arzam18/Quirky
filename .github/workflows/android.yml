@@ -73,12 +73,7 @@ jobs:
           echo "CXX=$CXX"
 
       # ============================================================
-      # 4. Remove x86-only compiler flags
-      #
-      # IMPORTANT:
-      # Match complete compiler flags only.
-      # Do NOT use simple .replace("-msse", "") because that
-      # corrupts -msse2, -msse3, -msse4.1, etc.
+      # 4. Remove ALL x86-only flags
       # ============================================================
       - name: Remove x86 flags
         shell: bash
@@ -87,9 +82,8 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
-          import re
 
-          bad_flags = [
+          flags = [
               "-msse",
               "-msse2",
               "-msse3",
@@ -103,52 +97,60 @@ jobs:
               "-mbmi2",
           ]
 
-          # Escape each flag and require whitespace/token boundaries.
-          pattern = re.compile(
-              r"(?<!\S)(?:"
-              + "|".join(re.escape(x) for x in bad_flags)
-              + r")(?!\S)"
-          )
+          p = Path("CMakeLists.txt")
 
-          for p in Path(".").rglob("*"):
+          if not p.exists():
+              raise SystemExit("ERROR: CMakeLists.txt not found.")
 
-              if not p.is_file():
-                  continue
+          s = p.read_text()
 
-              if p.name not in {
-                  "CMakeLists.txt",
-                  "Makefile",
-                  "makefile",
-              }:
-                  continue
+          print("Original CMakeLists.txt:")
+          print("--------------------------------")
+          print(s)
+          print("--------------------------------")
 
-              try:
-                  s = p.read_text()
-              except Exception:
-                  continue
+          # Remove exact compiler flags.
+          #
+          # The flags are separated by whitespace in the source,
+          # so replacing the complete strings is safe.
+          for flag in flags:
+              s = s.replace(flag, "")
 
-              new = pattern.sub("", s)
+          # Clean excessive whitespace.
+          lines = []
 
-              if new != s:
-                  p.write_text(new)
-                  print("Patched:", p)
+          for line in s.splitlines():
+              lines.append(" ".join(line.split()))
 
+          p.write_text("\n".join(lines) + "\n")
+
+          print()
+          print("Patched CMakeLists.txt:")
+          print("--------------------------------")
+          print(p.read_text())
+          print("--------------------------------")
           PY
 
           echo
-          echo "Checking for remaining x86 flags..."
+          echo "================================================"
+          echo "VERIFYING CMAKE FLAGS"
+          echo "================================================"
 
-          if grep -R -n -E \
-            --include='CMakeLists.txt' \
-            --include='Makefile' \
-            --include='makefile' \
-            -- '-msse|-mavx|-mbmi|-mpopcnt' .; then
+          cat CMakeLists.txt
 
+          echo
+          echo "Checking forbidden x86 flags..."
+
+          if grep -n -E -- \
+            '-msse([0-9.]*)|-mssse3|-mpopcnt|-mavx([0-9]*)|-mbmi([0-9]*)' \
+            CMakeLists.txt; then
+
+            echo
             echo "ERROR: x86 compiler flags remain."
             exit 1
           fi
 
-          echo "No x86 flags remain."
+          echo "SUCCESS: all x86 compiler flags removed."
 
       # ============================================================
       # 5. Patch launcher.h
@@ -164,10 +166,6 @@ jobs:
           p = Path("src/search/searcher/launcher.h")
           s = p.read_text()
 
-          # --------------------------------------------------------
-          # pthread include
-          # --------------------------------------------------------
-
           if "#include <pthread.h>" not in s:
 
               if "#include <thread>" in s:
@@ -178,10 +176,6 @@ jobs:
                   )
               else:
                   s = "#include <pthread.h>\n" + s
-
-          # --------------------------------------------------------
-          # Static pthread entry declaration
-          # --------------------------------------------------------
 
           if "static void* ThreadEntry(void* arg);" not in s:
 
@@ -198,10 +192,6 @@ jobs:
                   + "    static void* ThreadEntry(void* arg);\n\n"
                   + s[pos:]
               )
-
-          # --------------------------------------------------------
-          # Replace std::thread member
-          # --------------------------------------------------------
 
           if "std::thread thread_;" not in s:
               raise SystemExit(
@@ -220,8 +210,6 @@ jobs:
           PY
 
           echo
-          echo "===== launcher.h ====="
-
           grep -n -E \
             "pthread|ThreadEntry|thread_joinable|thread_" \
             src/search/searcher/launcher.h
@@ -241,9 +229,9 @@ jobs:
           p = Path("src/search/searcher/launcher.cpp")
           s = p.read_text()
 
-          # ========================================================
+          # --------------------------------------------------------
           # Includes
-          # ========================================================
+          # --------------------------------------------------------
 
           if "#include <memory>" not in s:
 
@@ -273,9 +261,9 @@ jobs:
               else:
                   s = "#include <pthread.h>\n" + s
 
-          # ========================================================
-          # Thread stack helper
-          # ========================================================
+          # --------------------------------------------------------
+          # pthread stack helper
+          # --------------------------------------------------------
 
           if "LAUNCHER_STACK_SIZE" not in s:
 
@@ -334,14 +322,13 @@ jobs:
                   1
               )
 
-          # ========================================================
+          # --------------------------------------------------------
           # LauncherThreadArgs
-          # ========================================================
+          # --------------------------------------------------------
 
           if "struct LauncherThreadArgs" not in s:
 
               marker = "void SearchLauncher::Start("
-
               pos = s.find(marker)
 
               if pos == -1:
@@ -365,14 +352,13 @@ jobs:
 
               s = s[:pos] + args_struct + s[pos:]
 
-          # ========================================================
+          # --------------------------------------------------------
           # ThreadEntry
-          # ========================================================
+          # --------------------------------------------------------
 
           if "SearchLauncher::ThreadEntry(void* raw)" not in s:
 
               marker = "void SearchLauncher::Start("
-
               pos = s.find(marker)
 
               if pos == -1:
@@ -401,9 +387,9 @@ jobs:
 
               s = s[:pos] + entry + s[pos:]
 
-          # ========================================================
-          # Replace OUTER std::thread
-          # ========================================================
+          # --------------------------------------------------------
+          # Replace outer std::thread
+          # --------------------------------------------------------
 
           outer_pattern = re.compile(
               r"""
@@ -463,11 +449,9 @@ jobs:
                   "ERROR: could not replace outer SearchLauncher std::thread."
               )
 
-          print("Outer SearchLauncher thread replaced.")
-
-          # ========================================================
+          # --------------------------------------------------------
           # Move Searcher to heap
-          # ========================================================
+          # --------------------------------------------------------
 
           old_searcher = (
               "Searcher searcher(tt_, rt, board, control_, stat);"
@@ -487,26 +471,24 @@ jobs:
                   1
               )
 
-              print("Searcher moved to heap.")
-
           elif "std::make_unique<Searcher>" not in s:
 
               raise SystemExit(
                   "ERROR: Searcher declaration not found."
               )
 
-          # ========================================================
-          # Change direct object access to pointer access
-          # ========================================================
+          # --------------------------------------------------------
+          # Pointer access
+          # --------------------------------------------------------
 
           s = s.replace(
               "searcher.Run(max_depth, real_pv_count);",
               "searcher->Run(max_depth, real_pv_count);"
           )
 
-          # ========================================================
-          # Replace INNER search std::thread
-          # ========================================================
+          # --------------------------------------------------------
+          # Replace inner search thread
+          # --------------------------------------------------------
 
           inner_pattern = re.compile(
               r"""
@@ -582,21 +564,14 @@ jobs:
                       "ERROR: could not replace inner search std::thread."
                   )
 
-          else:
-              print("Inner search thread replaced.")
-
-          # ========================================================
-          # Join search thread
-          # ========================================================
+          # --------------------------------------------------------
+          # Join
+          # --------------------------------------------------------
 
           s = s.replace(
               "search_thread.join();",
               "pthread_join(search_thread, nullptr);"
           )
-
-          # ========================================================
-          # SearchLauncher::Join
-          # ========================================================
 
           s = s.replace(
               "if (thread_.joinable()) {",
@@ -611,11 +586,11 @@ jobs:
 
           p.write_text(s)
 
-          print("launcher.cpp patching complete.")
+          print("launcher.cpp patched successfully.")
           PY
 
       # ============================================================
-      # 7. Verify source patch
+      # 7. Verify pthread conversion
       # ============================================================
       - name: Verify pthread conversion
         shell: bash
@@ -648,13 +623,6 @@ jobs:
 
           echo
           echo "================================================"
-          echo "THREAD ENTRY"
-          echo "================================================"
-
-          grep -n "ThreadEntry" "$FILE"
-
-          echo
-          echo "================================================"
           echo "HEAP SEARCHER"
           echo "================================================"
 
@@ -662,17 +630,17 @@ jobs:
 
           echo
           echo "================================================"
-          echo "NO std::thread"
+          echo "CHECK std::thread"
           echo "================================================"
 
           if grep -n "std::thread" "$FILE"; then
               echo
-              echo "ERROR: std::thread still remains in launcher.cpp."
+              echo "ERROR: std::thread still remains."
               exit 1
           fi
 
           echo
-          echo "SUCCESS: no std::thread remains in launcher.cpp."
+          echo "SUCCESS: no std::thread remains."
 
       # ============================================================
       # 8. Configure CMake
@@ -698,26 +666,30 @@ jobs:
             -DNO_AVX2=ON
 
       # ============================================================
-      # 9. Print actual compiler flags
+      # 9. Show generated compiler command
       # ============================================================
-      - name: Verify generated compiler flags
+      - name: Check generated flags
         shell: bash
         run: |
           set -e
 
-          echo "Checking generated build files..."
+          echo "Searching generated Ninja file..."
 
-          if grep -R -n -E \
-            '(^| )-[0-9]+(\.[0-9]+)?( |$)' \
-            build/CMakeFiles 2>/dev/null; then
-
-            echo
-            echo "WARNING: suspicious standalone numeric compiler argument found."
-          fi
+          grep -m 3 "clang++" build/build.ninja || true
 
           echo
-          echo "Compiler command preview:"
-          grep -R -m 1 -n "clang++" build/build.ninja || true
+          echo "Checking for broken standalone numeric arguments..."
+
+          if grep -E \
+            '(-O[0-9]+)[[:space:]]+[0-9]+[[:space:]]+[0-9]+' \
+            build/build.ninja; then
+
+            echo
+            echo "ERROR: broken numeric compiler arguments detected."
+            exit 1
+          fi
+
+          echo "Compiler flag check passed."
 
       # ============================================================
       # 10. Build
@@ -738,8 +710,6 @@ jobs:
         shell: bash
         run: |
           set -e
-
-          echo "Searching for executable..."
 
           find build \
             -type f \
