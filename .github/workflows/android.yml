@@ -15,11 +15,11 @@ jobs:
       # ============================================================
       # 1. Checkout
       # ============================================================
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
 
       # ============================================================
-      # 2. Find Android NDK
+      # 2. Locate Android NDK
       # ============================================================
       - name: Locate Android NDK
         shell: bash
@@ -30,10 +30,8 @@ jobs:
 
           if [ -d "$ANDROID_HOME/ndk/27.2.12479018" ]; then
             NDK="$ANDROID_HOME/ndk/27.2.12479018"
-          elif [ -d "$ANDROID_SDK_ROOT/ndk/27.2.12479018" ]; then
-            NDK="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
           else
-            for d in "$ANDROID_HOME/ndk/"* "$ANDROID_SDK_ROOT/ndk/"*; do
+            for d in "$ANDROID_HOME/ndk/"*; do
               if [ -x "$d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" ]; then
                 NDK="$d"
                 break
@@ -46,36 +44,31 @@ jobs:
             exit 1
           fi
 
-          echo "Using NDK:"
-          echo "$NDK"
-
           echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+          echo "Using NDK: $NDK"
 
       # ============================================================
       # 3. Configure ARM64 compiler
       # ============================================================
-      - name: Configure ARM64 compiler
+      - name: Configure compiler
         shell: bash
         run: |
           set -e
 
-          CLANG="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
-          CLANGXX="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+          LLVM="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          test -x "$CLANG"
-          test -x "$CLANGXX"
+          test -x "$LLVM/aarch64-linux-android24-clang"
+          test -x "$LLVM/aarch64-linux-android24-clang++"
 
-          echo "CC=$CLANG" >> "$GITHUB_ENV"
-          echo "CXX=$CLANGXX" >> "$GITHUB_ENV"
-
-          echo "CC=$CLANG"
-          echo "CXX=$CLANGXX"
+          echo "CC=$LLVM/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
+          echo "CXX=$LLVM/aarch64-linux-android24-clang++" >> "$GITHUB_ENV"
 
       # ============================================================
-      # 4. Remove x86-only flags from CMakeLists
+      # 4. Remove x86-only flags
       # ============================================================
-      - name: Remove x86 compiler flags
+      - name: Remove x86 flags
         shell: bash
         run: |
           set -e
@@ -83,15 +76,7 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          p = Path("CMakeLists.txt")
-
-          if not p.exists():
-              print("CMakeLists.txt not found at root; skipping direct edit.")
-              raise SystemExit(0)
-
-          s = p.read_text()
-
-          bad_flags = [
+          bad = [
               "-msse",
               "-msse2",
               "-msse3",
@@ -105,12 +90,30 @@ jobs:
               "-mbmi2",
           ]
 
-          for flag in bad_flags:
-              s = s.replace(flag, "")
+          for p in Path(".").rglob("*"):
+              if not p.is_file():
+                  continue
 
-          p.write_text(s)
+              if p.name not in {
+                  "CMakeLists.txt",
+                  "Makefile",
+                  "makefile",
+              }:
+                  continue
 
-          print("Removed x86-only compiler flags.")
+              try:
+                  s = p.read_text()
+              except Exception:
+                  continue
+
+              old = s
+
+              for flag in bad:
+                  s = s.replace(flag, "")
+
+              if s != old:
+                  p.write_text(s)
+                  print("Patched:", p)
           PY
 
       # ============================================================
@@ -121,56 +124,62 @@ jobs:
         run: |
           set -e
 
-          FILE="src/search/searcher/launcher.h"
-
-          test -f "$FILE"
-
           python3 <<'PY'
           from pathlib import Path
 
           p = Path("src/search/searcher/launcher.h")
           s = p.read_text()
 
-          # Add pthread header.
+          # Add pthread.
           if "#include <pthread.h>" not in s:
               s = s.replace(
                   "#include <thread>",
                   "#include <pthread.h>\n#include <thread>"
               )
 
-          # Replace std::thread member with pthread member.
-          old = "    std::thread thread_;"
+          # Add static pthread entry declaration.
+          marker = """    void StartMainThread(q_core::Board board, const std::vector<q_core::Move>& moves,
+                         time_control_t time_control, depth_t max_depth);"""
 
-          new = """    pthread_t thread_{};
-              bool thread_joinable_ = false;"""
+          replacement = """    void StartMainThread(q_core::Board board, const std::vector<q_core::Move>& moves,
+                         time_control_t time_control, depth_t max_depth);
 
-          if old not in s:
+    static void* ThreadEntry(void* arg);"""
+
+          if "static void* ThreadEntry(void* arg);" not in s:
+              if marker not in s:
+                  raise SystemExit(
+                      "ERROR: StartMainThread declaration not found in launcher.h"
+                  )
+              s = s.replace(marker, replacement, 1)
+
+          # Replace std::thread.
+          if "std::thread thread_;" not in s:
               raise SystemExit(
-                  "ERROR: expected 'std::thread thread_;' was not found in launcher.h"
+                  "ERROR: std::thread thread_ not found in launcher.h"
               )
 
-          s = s.replace(old, new, 1)
+          s = s.replace(
+              "    std::thread thread_;",
+              """    pthread_t thread_{};
+    bool thread_joinable_ = false;""",
+              1
+          )
 
           p.write_text(s)
 
           print("launcher.h patched successfully.")
           PY
 
-          grep -n -E "pthread|thread_joinable|thread_" "$FILE"
+          cat src/search/searcher/launcher.h
 
       # ============================================================
       # 6. Patch launcher.cpp
-      #
-      # Exact source structure from original Quirky.
       # ============================================================
       - name: Patch launcher.cpp
         shell: bash
         run: |
           set -e
-
-          FILE="src/search/searcher/launcher.cpp"
-
-          test -f "$FILE"
 
           python3 <<'PY'
           from pathlib import Path
@@ -179,26 +188,25 @@ jobs:
           s = p.read_text()
 
           # --------------------------------------------------------
-          # 1. Add pthread helper.
+          # Includes
           # --------------------------------------------------------
 
-          include_marker = '#include <string>\n#include <utility>'
-
-          include_replacement = '''#include <memory>
-          #include <pthread.h>
-          #include <string>
-          #include <utility>'''
-
-          if include_marker not in s:
-              raise SystemExit(
-                  "ERROR: expected include block was not found."
+          if "#include <memory>" not in s:
+              s = s.replace(
+                  '#include "launcher.h"\n',
+                  '#include "launcher.h"\n\n#include <memory>\n#include <pthread.h>\n',
+                  1
               )
 
-          s = s.replace(include_marker, include_replacement, 1)
+          # --------------------------------------------------------
+          # Stack/thread helper
+          # --------------------------------------------------------
 
-          namespace_marker = "namespace q_search {\n\nuint8_t GetRTByteSizeLog"
+          marker = """namespace q_search {
 
-          namespace_replacement = """namespace q_search {
+          uint8_t GetRTByteSizeLog"""
+
+          replacement = """namespace q_search {
 
           namespace {
 
@@ -239,209 +247,262 @@ jobs:
 
           uint8_t GetRTByteSizeLog"""
 
-          if namespace_marker not in s:
-              raise SystemExit(
-                  "ERROR: namespace insertion point was not found."
-              )
+          if "LAUNCHER_STACK_SIZE" not in s:
+              if marker not in s:
+                  raise SystemExit(
+                      "ERROR: namespace insertion point not found."
+                  )
 
-          s = s.replace(namespace_marker, namespace_replacement, 1)
+              s = s.replace(marker, replacement, 1)
 
           # --------------------------------------------------------
-          # 2. Replace SearchLauncher::Start.
+          # SearchLauncher::Start
+          #
+          # Replace only the actual std::thread part.
           # --------------------------------------------------------
 
-          old_start = """void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
-                             time_control_t time_control, depth_t max_depth) {
-              Join();
-              control_.Reset();
-              tt_.NextPosition();
-              thread_ = std::thread([this, board, moves, time_control, max_depth]() {
-                  StartMainThread(board, moves, time_control, max_depth);
-              });
-          }"""
+          old = """    thread_ = std::thread([this, board, moves, time_control, max_depth]() {
+        StartMainThread(board, moves, time_control, max_depth);
+    });"""
 
-          new_start = """void* SearchLauncherThreadEntry(void* raw) {
-              auto* args =
-                  static_cast<std::tuple<SearchLauncher*,
-                                         q_core::Board,
-                                         std::vector<q_core::Move>,
-                                         time_control_t,
-                                         depth_t>*>(raw);
+          new = """    struct StartArgs {
+        SearchLauncher* launcher;
+        q_core::Board board;
+        std::vector<q_core::Move> moves;
+        time_control_t time_control;
+        depth_t max_depth;
+    };
 
-              SearchLauncher* launcher = std::get<0>(*args);
+    auto* args = new StartArgs{
+        this,
+        board,
+        moves,
+        time_control,
+        max_depth
+    };
 
-              launcher->StartMainThread(
-                  std::get<1>(*args),
-                  std::get<2>(*args),
-                  std::get<3>(*args),
-                  std::get<4>(*args)
-              );
+    const int result = CreateThreadWithStack(
+        &thread_,
+        LAUNCHER_STACK_SIZE,
+        &SearchLauncher::ThreadEntry,
+        args
+    );
 
-              delete args;
-              return nullptr;
+    if (result != 0) {
+        delete args;
+        thread_joinable_ = false;
+        q_util::PrintError("Failed to create Quirky launcher thread");
+        return;
+    }
+
+    thread_joinable_ = true;"""
+
+          if "CreateThreadWithStack(" not in s or "thread_joinable_ = true;" not in s:
+              if old not in s:
+                  raise SystemExit(
+                      "ERROR: actual std::thread body in SearchLauncher::Start was not found."
+                  )
+
+              s = s.replace(old, new, 1)
+
+          # --------------------------------------------------------
+          # Insert ThreadEntry before Start()
+          # --------------------------------------------------------
+
+          marker = """void SearchLauncher::Start(const q_core::Board& board"""
+
+          entry = """void* SearchLauncher::ThreadEntry(void* raw) {
+    struct StartArgs {
+        SearchLauncher* launcher;
+        q_core::Board board;
+        std::vector<q_core::Move> moves;
+        time_control_t time_control;
+        depth_t max_depth;
+    };
+
+    auto* args = static_cast<StartArgs*>(raw);
+
+    args->launcher->StartMainThread(
+        args->board,
+        args->moves,
+        args->time_control,
+        args->max_depth
+    );
+
+    delete args;
+    return nullptr;
+}
+
+void SearchLauncher::Start(const q_core::Board& board"""
+
+          if "void* SearchLauncher::ThreadEntry(void* raw)" not in s:
+              if marker not in s:
+                  raise SystemExit(
+                      "ERROR: SearchLauncher::Start definition not found."
+                  )
+
+              s = s.replace(marker, entry, 1)
+
+          # --------------------------------------------------------
+          # IMPORTANT:
+          # The local StartArgs type above must be the SAME type
+          # expected by ThreadEntry.
+          #
+          # Because function-local types are different types in C++,
+          # replace both with a namespace-level helper structure.
+          # --------------------------------------------------------
+
+          bad_entry_start = """void* SearchLauncher::ThreadEntry(void* raw) {
+    struct StartArgs {
+        SearchLauncher* launcher;
+        q_core::Board board;
+        std::vector<q_core::Move> moves;
+        time_control_t time_control;
+        depth_t max_depth;
+    };
+
+    auto* args = static_cast<StartArgs*>(raw);"""
+
+          good_entry_start = """namespace {
+
+          struct LauncherThreadArgs {
+              SearchLauncher* launcher;
+              q_core::Board board;
+              std::vector<q_core::Move> moves;
+              time_control_t time_control;
+              depth_t max_depth;
+          };
+
           }
 
-          void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
-                                     time_control_t time_control, depth_t max_depth) {
-              Join();
-              control_.Reset();
-              tt_.NextPosition();
+          void* SearchLauncher::ThreadEntry(void* raw) {
+    auto* args = static_cast<LauncherThreadArgs*>(raw);"""
 
-              using Args = std::tuple<
-                  SearchLauncher*,
-                  q_core::Board,
-                  std::vector<q_core::Move>,
-                  time_control_t,
-                  depth_t
-              >;
-
-              auto* args = new Args(
-                  this,
-                  board,
-                  moves,
-                  time_control,
-                  max_depth
-              );
-
-              const int result = CreateThreadWithStack(
-                  &thread_,
-                  LAUNCHER_STACK_SIZE,
-                  SearchLauncherThreadEntry,
-                  args
-              );
-
-              if (result != 0) {
-                  delete args;
-                  thread_joinable_ = false;
-
-                  q_util::PrintError(
-                      "Failed to create Quirky launcher thread"
-                  );
-
-                  return;
-              }
-
-              thread_joinable_ = true;
-          }"""
-
-          if old_start not in s:
-              raise SystemExit(
-                  "ERROR: exact original SearchLauncher::Start block was not found."
+          if bad_entry_start in s:
+              s = s.replace(
+                  bad_entry_start,
+                  good_entry_start,
+                  1
               )
 
-          s = s.replace(old_start, new_start, 1)
+          # Change Start's local struct to LauncherThreadArgs.
+          start_struct = """    struct StartArgs {
+        SearchLauncher* launcher;
+        q_core::Board board;
+        std::vector<q_core::Move> moves;
+        time_control_t time_control;
+        depth_t max_depth;
+    };
 
-          # --------------------------------------------------------
-          # 3. Move Searcher from stack to heap and use a 32 MB
-          #    pthread stack for the actual search.
-          # --------------------------------------------------------
+    auto* args = new StartArgs{"""
 
-          old_search = """    SearchStat stat;
-              Searcher searcher(tt_, rt, board, control_, stat);
-              SearchTimer timer(time_control, board, stat);
-              std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });"""
-
-          new_search = """    SearchStat stat;
-
-              auto searcher = std::make_unique<Searcher>(
-                  tt_,
-                  rt,
-                  board,
-                  control_,
-                  stat
-              );
-
-              SearchTimer timer(time_control, board, stat);
-
-              struct SearchThreadArgs {
-                  Searcher* searcher;
-                  depth_t max_depth;
-                  size_t pv_count;
-              };
-
-              auto* search_args = new SearchThreadArgs{
-                  searcher.get(),
-                  max_depth,
-                  real_pv_count
-              };
-
-              pthread_t search_thread{};
-
-              const int search_result = CreateThreadWithStack(
-                  &search_thread,
-                  SEARCH_STACK_SIZE,
-                  [](void* raw) -> void* {
-                      auto* args =
-                          static_cast<SearchThreadArgs*>(raw);
-
-                      args->searcher->Run(
-                          args->max_depth,
-                          args->pv_count
-                      );
-
-                      delete args;
-                      return nullptr;
-                  },
-                  search_args
-              );
-
-              if (search_result != 0) {
-                  delete search_args;
-
-                  q_util::PrintError(
-                      "Failed to create Quirky search thread"
-                  );
-
-                  return;
-              }"""
-
-          if old_search not in s:
-              raise SystemExit(
-                  "ERROR: exact original Searcher/thread block was not found."
+          if start_struct in s:
+              s = s.replace(
+                  start_struct,
+                  """    auto* args = new LauncherThreadArgs{""",
+                  1
               )
 
-          s = s.replace(old_search, new_search, 1)
-
           # --------------------------------------------------------
-          # 4. Replace search_thread.join().
+          # Move Searcher to heap.
           # --------------------------------------------------------
 
-          old_join = "    search_thread.join();"
+          old_searcher = """    SearchStat stat;
+    Searcher searcher(tt_, rt, board, control_, stat);
+    SearchTimer timer(time_control, board, stat);
+    std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });"""
 
-          new_join = "    pthread_join(search_thread, nullptr);"
+          new_searcher = """    SearchStat stat;
 
-          if old_join not in s:
+    auto searcher = std::make_unique<Searcher>(
+        tt_,
+        rt,
+        board,
+        control_,
+        stat
+    );
+
+    SearchTimer timer(time_control, board, stat);
+
+    struct SearchThreadArgs {
+        Searcher* searcher;
+        depth_t max_depth;
+        size_t pv_count;
+    };
+
+    auto* search_args = new SearchThreadArgs{
+        searcher.get(),
+        max_depth,
+        real_pv_count
+    };
+
+    pthread_t search_thread{};
+
+    const int search_result = CreateThreadWithStack(
+        &search_thread,
+        SEARCH_STACK_SIZE,
+        [](void* raw) -> void* {
+            auto* args = static_cast<SearchThreadArgs*>(raw);
+
+            args->searcher->Run(
+                args->max_depth,
+                args->pv_count
+            );
+
+            delete args;
+            return nullptr;
+        },
+        search_args
+    );
+
+    if (search_result != 0) {
+        delete search_args;
+        q_util::PrintError("Failed to create Quirky search thread");
+        return;
+    }"""
+
+          if "auto searcher = std::make_unique<Searcher>" not in s:
+              if old_searcher not in s:
+                  raise SystemExit(
+                      "ERROR: original Searcher/search_thread block was not found."
+                  )
+
+              s = s.replace(old_searcher, new_searcher, 1)
+
+          # --------------------------------------------------------
+          # Search thread join
+          # --------------------------------------------------------
+
+          s = s.replace(
+              "    search_thread.join();",
+              "    pthread_join(search_thread, nullptr);"
+          )
+
+          # --------------------------------------------------------
+          # SearchLauncher::Join
+          # --------------------------------------------------------
+
+          old_join = """void SearchLauncher::Join() {
+    if (thread_.joinable()) {
+        control_.Stop();
+        thread_.join();
+    }
+}"""
+
+          new_join = """void SearchLauncher::Join() {
+    if (thread_joinable_) {
+        control_.Stop();
+        pthread_join(thread_, nullptr);
+        thread_joinable_ = false;
+    }
+}"""
+
+          if old_join in s:
+              s = s.replace(old_join, new_join, 1)
+          elif "thread_.joinable()" in s:
               raise SystemExit(
-                  "ERROR: search_thread.join() was not found."
+                  "ERROR: Join() contains std::thread join but expected block was not found."
               )
-
-          s = s.replace(old_join, new_join, 1)
-
-          # --------------------------------------------------------
-          # 5. Replace SearchLauncher::Join().
-          # --------------------------------------------------------
-
-          old_launcher_join = """void SearchLauncher::Join() {
-              if (thread_.joinable()) {
-                  control_.Stop();
-                  thread_.join();
-              }
-          }"""
-
-          new_launcher_join = """void SearchLauncher::Join() {
-              if (thread_joinable_) {
-                  control_.Stop();
-                  pthread_join(thread_, nullptr);
-                  thread_joinable_ = false;
-              }
-          }"""
-
-          if old_launcher_join not in s:
-              raise SystemExit(
-                  "ERROR: exact original SearchLauncher::Join block was not found."
-              )
-
-          s = s.replace(old_launcher_join, new_launcher_join, 1)
 
           p.write_text(s)
 
@@ -449,50 +510,35 @@ jobs:
           PY
 
       # ============================================================
-      # 7. Verify patch
+      # 7. Verify source modifications
       # ============================================================
-      - name: Verify pthread and heap changes
+      - name: Verify patches
         shell: bash
         run: |
           set -e
 
-          echo "=== pthread stack settings ==="
-          grep -n "STACK_SIZE" src/search/searcher/launcher.cpp
-
-          echo
-          echo "=== pthread creation ==="
-          grep -n "pthread_create\|CreateThreadWithStack" \
+          echo "===== launcher.cpp ====="
+          grep -n -E \
+            "LAUNCHER_STACK_SIZE|SEARCH_STACK_SIZE|pthread_create|pthread_join|make_unique|ThreadEntry|thread_joinable" \
             src/search/searcher/launcher.cpp
 
           echo
-          echo "=== heap Searcher ==="
-          grep -n "make_unique<Searcher>" \
-            src/search/searcher/launcher.cpp
+          echo "===== remaining std::thread ====="
 
-          echo
-          echo "=== pthread joins ==="
-          grep -n "pthread_join" \
-            src/search/searcher/launcher.cpp
-
-          echo
-          echo "=== remaining std::thread in launcher.cpp ==="
           if grep -n "std::thread" src/search/searcher/launcher.cpp; then
             echo "ERROR: std::thread still remains in launcher.cpp."
             exit 1
           fi
 
-      # ============================================================
-      # 8. Print patched source
-      # ============================================================
-      - name: Show patched launcher
-        shell: bash
-        run: |
-          sed -n '1,125p' src/search/searcher/launcher.cpp
-          echo "=============================="
-          sed -n '125,280p' src/search/searcher/launcher.cpp
+          echo
+          echo "===== launcher.h ====="
+
+          grep -n -E \
+            "pthread|ThreadEntry|thread_joinable|thread_" \
+            src/search/searcher/launcher.h
 
       # ============================================================
-      # 9. Configure CMake
+      # 8. Configure
       # ============================================================
       - name: Configure CMake
         shell: bash
@@ -515,7 +561,7 @@ jobs:
             -DNO_AVX2=ON
 
       # ============================================================
-      # 10. Build
+      # 9. Build
       # ============================================================
       - name: Build Quirky
         shell: bash
@@ -527,53 +573,41 @@ jobs:
             --verbose
 
       # ============================================================
-      # 11. Find executable
+      # 10. Locate binary
       # ============================================================
-      - name: Locate Quirky binary
+      - name: Package binary
         shell: bash
         run: |
           set -e
 
-          echo "Searching for executables..."
-
+          echo "Executables:"
           find build -type f -perm -111 -print
 
           BINARY=""
 
-          for candidate in \
-              build/Quirky \
-              build/quirky \
-              build/src/Quirky \
-              build/src/quirky; do
+          for f in \
+            build/Quirky \
+            build/quirky \
+            build/src/Quirky \
+            build/src/quirky; do
 
-              if [ -f "$candidate" ]; then
-                  BINARY="$candidate"
-                  break
-              fi
+            if [ -f "$f" ]; then
+              BINARY="$f"
+              break
+            fi
           done
 
           if [ -z "$BINARY" ]; then
-              BINARY="$(find build -type f -perm -111 | head -n 1)"
+            BINARY="$(find build -type f -perm -111 | head -n 1)"
           fi
 
           if [ -z "$BINARY" ]; then
-              echo "ERROR: no executable found."
-              exit 1
+            echo "ERROR: executable not found."
+            exit 1
           fi
-
-          echo "Found:"
-          echo "$BINARY"
 
           cp "$BINARY" Quirky-android-arm64
           chmod +x Quirky-android-arm64
-
-      # ============================================================
-      # 12. ELF verification
-      # ============================================================
-      - name: Verify ARM64 binary
-        shell: bash
-        run: |
-          set -e
 
           file Quirky-android-arm64
 
@@ -581,9 +615,9 @@ jobs:
             grep -E "Class:|Machine:|Type:"
 
       # ============================================================
-      # 13. Upload binary
+      # 11. Upload
       # ============================================================
-      - name: Upload Quirky Android ARM64
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: Quirky-Android-ARM64
