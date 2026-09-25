@@ -35,7 +35,7 @@ jobs:
             >> "$GITHUB_ENV"
 
       # ============================================================
-      # Remove x86 compiler flags from ALL CMake files.
+      # Remove x86 compiler flags
       # ============================================================
       - name: Remove x86 flags
         shell: bash
@@ -64,16 +64,13 @@ jobs:
               "-mxop",
           ]
 
-          files = []
-
           for p in Path(".").rglob("*"):
               if not p.is_file():
                   continue
 
-              if p.name == "CMakeLists.txt" or p.suffix == ".cmake":
-                  files.append(p)
+              if p.name != "CMakeLists.txt" and p.suffix != ".cmake":
+                  continue
 
-          for p in files:
               try:
                   text = p.read_text()
               except Exception:
@@ -81,34 +78,26 @@ jobs:
 
               original = text
 
-              # Remove complete flags.
               for flag in sorted(bad_flags, key=len, reverse=True):
                   text = re.sub(
-                      rf'(?<![A-Za-z0-9_]){re.escape(flag)}(?![A-Za-z0-9_.-])',
-                      '',
+                      rf"(?<![A-Za-z0-9_]){re.escape(flag)}(?![A-Za-z0-9_.-])",
+                      "",
                       text
                   )
 
-              # Remove numeric fragments left by previous bad
-              # replacements, but ONLY on compiler flag lines.
-              new_lines = []
+              lines = []
 
               for line in text.splitlines():
-                  if (
-                      "CMAKE_CXX_FLAGS" in line
-                      or "CMAKE_C_FLAGS" in line
-                  ):
+                  if "CMAKE_CXX_FLAGS" in line or "CMAKE_C_FLAGS" in line:
                       line = re.sub(
-                          r'(?<![A-Za-z0-9_.-])'
-                          r'(?:2|3|4\.1|4\.2)'
-                          r'(?![A-Za-z0-9_.-])',
-                          '',
+                          r"(?<![A-Za-z0-9_.-])(?:2|3|4\.1|4\.2)(?![A-Za-z0-9_.-])",
+                          "",
                           line
                       )
 
-                  new_lines.append(line)
+                  lines.append(line)
 
-              text = "\n".join(new_lines)
+              text = "\n".join(lines)
 
               if original.endswith("\n"):
                   text += "\n"
@@ -125,7 +114,7 @@ jobs:
           set -e
 
           echo "========================================"
-          echo "CMAKE FLAG LINES"
+          echo "CMAKE FLAGS"
           echo "========================================"
 
           grep -RIn \
@@ -152,7 +141,7 @@ jobs:
           echo "OK: no x86 flags."
 
       # ============================================================
-      # Configure ARM64 Android.
+      # Configure ARM64
       # ============================================================
       - name: Configure ARM64
         shell: bash
@@ -163,9 +152,6 @@ jobs:
 
           export CC="$TOOLCHAIN/aarch64-linux-android24-clang"
           export CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
-
-          echo "CC=$CC"
-          echo "CXX=$CXX"
 
           "$CC" --version
           "$CXX" --version
@@ -179,20 +165,20 @@ jobs:
             -DCMAKE_CXX_FLAGS="-O3 -fno-fast-math -fno-omit-frame-pointer -pthread" \
             -DCMAKE_EXE_LINKER_FLAGS="-pthread"
 
-      - name: Verify generated Ninja flags
+      - name: Verify generated flags
         shell: bash
         run: |
           set -e
 
           echo "========================================"
-          echo "GENERATED FLAGS"
+          echo "GENERATED NINJA FLAGS"
           echo "========================================"
 
           grep -n "FLAGS =" build/build.ninja | head -30 || true
 
           echo
           echo "========================================"
-          echo "BAD X86 FLAG CHECK"
+          echo "BAD FLAG CHECK"
           echo "========================================"
 
           if grep -nE \
@@ -214,15 +200,7 @@ jobs:
           echo "OK: generated flags are clean."
 
       # ============================================================
-      # Patch BOTH Quirky threads.
-      #
-      # Outer thread:
-      #   SearchLauncher::Start()
-      #
-      # Inner search thread:
-      #   StartMainThread()
-      #
-      # The Android crash showed stack overflow in the search thread.
+      # Patch BOTH Quirky pthreads
       # ============================================================
       - name: Patch Quirky threading
         shell: bash
@@ -231,9 +209,16 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           h = Path("src/search/searcher/launcher.h")
           cpp = Path("src/search/searcher/launcher.cpp")
+
+          if not h.exists():
+              raise SystemExit("ERROR: launcher.h not found")
+
+          if not cpp.exists():
+              raise SystemExit("ERROR: launcher.cpp not found")
 
           hs = h.read_text()
           cs = cpp.read_text()
@@ -248,9 +233,9 @@ jobs:
           )
 
           hs = hs.replace(
-              "    std::thread thread_;\n",
+              "    std::thread thread_;",
               "    pthread_t thread_{};\n"
-              "    bool thread_joinable_ = false;\n"
+              "    bool thread_joinable_ = false;"
           )
 
           h.write_text(hs)
@@ -259,272 +244,317 @@ jobs:
           # launcher.cpp includes
           # --------------------------------------------------------
 
-          cs = cs.replace(
-              "#include <string>\n",
-              "#include <string>\n"
-              "#include <pthread.h>\n"
-              "#include <memory>\n"
-          )
+          if "#include <pthread.h>" not in cs:
+              lines = cs.splitlines()
+
+              insert_at = 0
+
+              for i, line in enumerate(lines):
+                  if line.startswith("#include "):
+                      insert_at = i + 1
+
+              lines.insert(insert_at, "#include <pthread.h>")
+              lines.insert(insert_at + 1, "#include <memory>")
+
+              cs = "\n".join(lines) + "\n"
 
           # --------------------------------------------------------
-          # Insert helper structures/functions immediately after
-          # namespace q_search {
+          # Constants
           # --------------------------------------------------------
-
-          marker = "namespace q_search {\n"
 
           if "LAUNCHER_STACK_SIZE" not in cs:
 
-              helper = r'''
-          namespace {
+              marker = "namespace q_search {"
 
-          constexpr size_t LAUNCHER_STACK_SIZE = 16 * 1024 * 1024;
-          constexpr size_t SEARCH_STACK_SIZE   = 32 * 1024 * 1024;
+              helper = [
+                  "",
+                  "namespace {",
+                  "",
+                  "constexpr size_t LAUNCHER_STACK_SIZE = 16 * 1024 * 1024;",
+                  "constexpr size_t SEARCH_STACK_SIZE = 32 * 1024 * 1024;",
+                  "",
+                  "struct LauncherThreadArgs {",
+                  "    SearchLauncher* self;",
+                  "    q_core::Board board;",
+                  "    std::vector<q_core::Move> moves;",
+                  "    time_control_t time_control;",
+                  "    depth_t max_depth;",
+                  "};",
+                  "",
+                  "struct SearchThreadArgs {",
+                  "    Searcher* searcher;",
+                  "    depth_t max_depth;",
+                  "    size_t real_pv_count;",
+                  "};",
+                  "",
+                  "void* SearchThreadEntry(void* raw) {",
+                  "    auto* args = static_cast<SearchThreadArgs*>(raw);",
+                  "",
+                  "    args->searcher->Run(",
+                  "        args->max_depth,",
+                  "        args->real_pv_count",
+                  "    );",
+                  "",
+                  "    delete args;",
+                  "    return nullptr;",
+                  "}",
+                  "",
+                  "void* LauncherThreadEntry(void* raw) {",
+                  "    auto* args = static_cast<LauncherThreadArgs*>(raw);",
+                  "",
+                  "    args->self->StartMainThread(",
+                  "        args->board,",
+                  "        args->moves,",
+                  "        args->time_control,",
+                  "        args->max_depth",
+                  "    );",
+                  "",
+                  "    delete args;",
+                  "    return nullptr;",
+                  "}",
+                  "",
+                  "bool CreateThreadWithStack(",
+                  "    pthread_t* thread,",
+                  "    size_t stack_size,",
+                  "    void* (*entry)(void*),",
+                  "    void* arg",
+                  ") {",
+                  "    pthread_attr_t attr;",
+                  "",
+                  "    if (pthread_attr_init(&attr) != 0)",
+                  "        return false;",
+                  "",
+                  "    if (pthread_attr_setstacksize(&attr, stack_size) != 0) {",
+                  "        pthread_attr_destroy(&attr);",
+                  "        return false;",
+                  "    }",
+                  "",
+                  "    int result = pthread_create(",
+                  "        thread,",
+                  "        &attr,",
+                  "        entry,",
+                  "        arg",
+                  "    );",
+                  "",
+                  "    pthread_attr_destroy(&attr);",
+                  "",
+                  "    return result == 0;",
+                  "}",
+                  "",
+                  "} // namespace",
+                  ""
+              ]
 
-          struct LauncherThreadArgs {
-              SearchLauncher* self;
-              q_core::Board board;
-              std::vector<q_core::Move> moves;
-              time_control_t time_control;
-              depth_t max_depth;
-          };
+              helper_text = "\n".join(helper)
 
-          struct SearchThreadArgs {
-              Searcher* searcher;
-              depth_t max_depth;
-              size_t real_pv_count;
-          };
-
-          void* SearchThreadEntry(void* raw) {
-              auto* args =
-                  static_cast<SearchThreadArgs*>(raw);
-
-              args->searcher->Run(
-                  args->max_depth,
-                  args->real_pv_count
-              );
-
-              delete args;
-              return nullptr;
-          }
-
-          void* LauncherThreadEntry(void* raw) {
-              auto* args =
-                  static_cast<LauncherThreadArgs*>(raw);
-
-              args->self->StartMainThread(
-                  args->board,
-                  args->moves,
-                  args->time_control,
-                  args->max_depth
-              );
-
-              delete args;
-              return nullptr;
-          }
-
-          bool CreateThreadWithStack(
-              pthread_t* thread,
-              size_t stack_size,
-              void* (*entry)(void*),
-              void* arg)
-          {
-              pthread_attr_t attr;
-
-              if (pthread_attr_init(&attr) != 0)
-                  return false;
-
-              if (pthread_attr_setstacksize(
-                      &attr,
-                      stack_size) != 0) {
-
-                  pthread_attr_destroy(&attr);
-                  return false;
-              }
-
-              int result = pthread_create(
-                  thread,
-                  &attr,
-                  entry,
-                  arg
-              );
-
-              pthread_attr_destroy(&attr);
-
-              return result == 0;
-          }
-
-          } // namespace
-
-          '''
+              if marker not in cs:
+                  raise SystemExit(
+                      "ERROR: namespace q_search not found"
+                  )
 
               cs = cs.replace(
                   marker,
-                  marker + helper,
+                  marker + helper_text,
                   1
               )
 
           # --------------------------------------------------------
-          # Replace the ORIGINAL Start() body exactly.
+          # Replace Start() body using brace matching.
           # --------------------------------------------------------
 
-          old_start = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
-                           time_control_t time_control, depth_t max_depth) {
-    Join();
-    control_.Reset();
-    tt_.NextPosition();
-    thread_ = std::thread([this, board, moves, time_control, max_depth]() {
-        StartMainThread(board, moves, time_control, max_depth);
-    });
-}'''
+          start = cs.find("void SearchLauncher::Start(")
 
-          new_start = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
-                           time_control_t time_control, depth_t max_depth) {
-    Join();
-    control_.Reset();
-    tt_.NextPosition();
-
-    auto* args = new LauncherThreadArgs{
-        this,
-        board,
-        moves,
-        time_control,
-        max_depth
-    };
-
-    if (!CreateThreadWithStack(
-            &thread_,
-            LAUNCHER_STACK_SIZE,
-            LauncherThreadEntry,
-            args)) {
-
-        delete args;
-        thread_joinable_ = false;
-        return;
-    }
-
-    thread_joinable_ = true;
-}'''
-
-          if old_start not in cs:
+          if start < 0:
               raise SystemExit(
-                  "ERROR: original SearchLauncher::Start() "
-                  "was not found exactly."
+                  "ERROR: SearchLauncher::Start not found"
               )
 
-          cs = cs.replace(
-              old_start,
-              new_start,
-              1
-          )
+          brace = cs.find("{", start)
 
-          # --------------------------------------------------------
-          # Replace Searcher stack object with heap object.
-          # --------------------------------------------------------
-
-          old_searcher = '''    Searcher searcher(tt_, rt, board, control_, stat);
-    SearchTimer timer(time_control, board, stat);
-    std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });'''
-
-          new_searcher = '''    auto searcher = std::make_unique<Searcher>(
-        tt_,
-        rt,
-        board,
-        control_,
-        stat
-    );
-
-    SearchTimer timer(time_control, board, stat);
-
-    auto* search_args = new SearchThreadArgs{
-        searcher.get(),
-        max_depth,
-        real_pv_count
-    };
-
-    pthread_t search_thread{};
-
-    if (!CreateThreadWithStack(
-            &search_thread,
-            SEARCH_STACK_SIZE,
-            SearchThreadEntry,
-            search_args)) {
-
-        delete search_args;
-        return;
-    }'''
-
-          if old_searcher not in cs:
+          if brace < 0:
               raise SystemExit(
-                  "ERROR: Searcher/std::thread search block "
-                  "was not found exactly."
+                  "ERROR: Start() opening brace not found"
               )
 
-          cs = cs.replace(
-              old_searcher,
-              new_searcher,
-              1
-          )
+          depth = 0
+          end = -1
 
-          # --------------------------------------------------------
-          # Replace the inner search_thread.join().
-          # --------------------------------------------------------
+          for i in range(brace, len(cs)):
+              if cs[i] == "{":
+                  depth += 1
+              elif cs[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      end = i + 1
+                      break
 
-          old_join = "    search_thread.join();"
-
-          new_join = '''    pthread_join(search_thread, nullptr);'''
-
-          if old_join not in cs:
+          if end < 0:
               raise SystemExit(
-                  "ERROR: search_thread.join() was not found."
+                  "ERROR: Start() closing brace not found"
               )
 
-          cs = cs.replace(
-              old_join,
-              new_join,
-              1
+          start_body = [
+              cs[start:brace + 1],
+              "    Join();",
+              "    control_.Reset();",
+              "    tt_.NextPosition();",
+              "",
+              "    auto* args = new LauncherThreadArgs{",
+              "        this,",
+              "        board,",
+              "        moves,",
+              "        time_control,",
+              "        max_depth",
+              "    };",
+              "",
+              "    if (!CreateThreadWithStack(",
+              "            &thread_,",
+              "            LAUNCHER_STACK_SIZE,",
+              "            LauncherThreadEntry,",
+              "            args)) {",
+              "",
+              "        delete args;",
+              "        thread_joinable_ = false;",
+              "        return;",
+              "    }",
+              "",
+              "    thread_joinable_ = true;",
+              "}"
+          ]
+
+          cs = cs[:start] + "\n".join(start_body) + cs[end:]
+
+          # --------------------------------------------------------
+          # Replace inner Searcher + std::thread block.
+          # --------------------------------------------------------
+
+          pattern = re.compile(
+              r"\s*Searcher\s+searcher\s*\("
+              r".*?"
+              r"std::thread\s+search_thread\s*="
+              r"\s*std::thread\s*\(\[&\]\(\)\s*\{"
+              r".*?"
+              r"\}\s*\);",
+              re.DOTALL
           )
 
-          # --------------------------------------------------------
-          # Replace outer Join().
-          # --------------------------------------------------------
+          replacement = "\n".join([
+              "",
+              "    auto searcher = std::make_unique<Searcher>(",
+              "        tt_,",
+              "        rt,",
+              "        board,",
+              "        control_,",
+              "        stat",
+              "    );",
+              "",
+              "    SearchTimer timer(time_control, board, stat);",
+              "",
+              "    auto* search_args = new SearchThreadArgs{",
+              "        searcher.get(),",
+              "        max_depth,",
+              "        real_pv_count",
+              "    };",
+              "",
+              "    pthread_t search_thread{};",
+              "",
+              "    if (!CreateThreadWithStack(",
+              "            &search_thread,",
+              "            SEARCH_STACK_SIZE,",
+              "            SearchThreadEntry,",
+              "            search_args)) {",
+              "",
+              "        delete search_args;",
+              "        return;",
+              "    }"
+          ])
 
-          old_outer_join = '''void SearchLauncher::Join() {
-    if (thread_.joinable()) {
-        control_.Stop();
-        thread_.join();
-    }
-}'''
+          new_cs, count = pattern.subn(
+              replacement,
+              cs,
+              count=1
+          )
 
-          new_outer_join = '''void SearchLauncher::Join() {
-    if (thread_joinable_) {
-        control_.Stop();
-        pthread_join(thread_, nullptr);
-        thread_joinable_ = false;
-    }
-}'''
-
-          if old_outer_join not in cs:
+          if count != 1:
               raise SystemExit(
-                  "ERROR: original Join() was not found exactly."
+                  "ERROR: Searcher/std::thread block not found"
               )
 
-          cs = cs.replace(
-              old_outer_join,
-              new_outer_join,
-              1
+          cs = new_cs
+
+          # --------------------------------------------------------
+          # Replace inner join.
+          # --------------------------------------------------------
+
+          if "search_thread.join();" in cs:
+              cs = cs.replace(
+                  "search_thread.join();",
+                  "pthread_join(search_thread, nullptr);"
+              )
+          elif "pthread_join(search_thread" not in cs:
+              raise SystemExit(
+                  "ERROR: search_thread join not found"
+              )
+
+          # --------------------------------------------------------
+          # Replace outer Join() using brace matching.
+          # --------------------------------------------------------
+
+          join_start = cs.find(
+              "void SearchLauncher::Join("
           )
+
+          if join_start < 0:
+              raise SystemExit(
+                  "ERROR: SearchLauncher::Join not found"
+              )
+
+          join_brace = cs.find("{", join_start)
+
+          if join_brace < 0:
+              raise SystemExit(
+                  "ERROR: Join opening brace not found"
+              )
+
+          depth = 0
+          join_end = -1
+
+          for i in range(join_brace, len(cs)):
+              if cs[i] == "{":
+                  depth += 1
+              elif cs[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      join_end = i + 1
+                      break
+
+          if join_end < 0:
+              raise SystemExit(
+                  "ERROR: Join closing brace not found"
+              )
+
+          join_text = "\n".join([
+              cs[join_start:join_brace + 1],
+              "    if (thread_joinable_) {",
+              "        control_.Stop();",
+              "        pthread_join(thread_, nullptr);",
+              "        thread_joinable_ = false;",
+              "    }",
+              "}"
+          ])
+
+          cs = cs[:join_start] + join_text + cs[join_end:]
 
           cpp.write_text(cs)
 
-          print("Thread patch completed.")
+          print("Thread patch completed successfully.")
 
           PY
 
       # ============================================================
-      # Verify BOTH threads are gone from launcher.cpp.
+      # Verify threading patch
       # ============================================================
-      - name: Verify pthread patch
+      - name: Verify threading
         shell: bash
         run: |
           set -e
@@ -538,18 +568,11 @@ jobs:
 
           echo
           echo "========================================"
-          echo "PTHREAD CREATION"
+          echo "PTHREAD"
           echo "========================================"
 
-          grep -n "pthread_create\|CreateThreadWithStack" \
-            src/search/searcher/launcher.cpp
-
-          echo
-          echo "========================================"
-          echo "SEARCH THREAD"
-          echo "========================================"
-
-          grep -n "SearchThreadEntry\|search_thread\|SEARCH_STACK_SIZE" \
+          grep -nE \
+            "pthread_create|pthread_join|CreateThreadWithStack|SearchThreadEntry" \
             src/search/searcher/launcher.cpp
 
           echo
@@ -580,16 +603,12 @@ jobs:
           cmake --build build --parallel 2
 
       # ============================================================
-      # Find executable
+      # Find binary
       # ============================================================
       - name: Find binary
         shell: bash
         run: |
           set -e
-
-          echo "========================================"
-          echo "EXECUTABLES"
-          echo "========================================"
 
           find build \
             -type f \
@@ -611,9 +630,6 @@ jobs:
           echo "BIN=$BIN"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-      # ============================================================
-      # Verify AArch64
-      # ============================================================
       - name: Verify ARM64
         shell: bash
         run: |
@@ -645,8 +661,7 @@ jobs:
           chmod +x \
             artifact/Quirky-android-arm64
 
-          ls -lh \
-            artifact/Quirky-android-arm64
+          ls -lh artifact/Quirky-android-arm64
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
