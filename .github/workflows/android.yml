@@ -49,22 +49,6 @@ jobs:
 
       # ============================================================
       # PATCH CMAKE
-      #
-      # The original CMakeLists contains:
-      #
-      # -msse
-      # -msse2
-      # -msse3
-      # -mssse3
-      # -msse4.1
-      # -msse4.2
-      # -mpopcnt
-      # -mavx
-      # -mavx2
-      # -mbmi
-      # -mbmi2
-      #
-      # These are x86-only.
       # ============================================================
       - name: Patch CMakeLists for ARM64
         shell: bash
@@ -87,7 +71,10 @@ jobs:
 
           for line in lines:
 
-              if re.match(r'^\s*set\s*\(\s*CMAKE_CXX_FLAGS\b', line):
+              if re.match(
+                  r'^\s*set\s*\(\s*CMAKE_CXX_FLAGS\b',
+                  line
+              ):
 
                   if not inserted:
                       output.append(
@@ -105,7 +92,9 @@ jobs:
                   'set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")'
               )
 
-          path.write_text("\n".join(output) + "\n")
+          path.write_text(
+              "\n".join(output) + "\n"
+          )
 
           print("Patched CMakeLists.txt")
           PY
@@ -116,7 +105,7 @@ jobs:
 
 
       # ============================================================
-      # VERIFY NO X86 FLAGS IN CMAKE
+      # VERIFY CMAKE
       # ============================================================
       - name: Verify CMake flags
         shell: bash
@@ -138,17 +127,9 @@ jobs:
 
 
       # ============================================================
-      # REPLACE AVX2 NNUE LAYERS
-      #
-      # Original layers.h is explicitly AVX2-only.
-      #
-      # This first ARM build uses scalar implementations with
-      # the same layer interfaces and weight layout.
-      #
-      # Correctness first.
-      # NEON optimization comes later.
+      # ARM-SAFE NNUE LAYERS
       # ============================================================
-      - name: Replace AVX2 NNUE layers with ARM-safe implementation
+      - name: Replace AVX2 NNUE layers
         shell: bash
         run: |
           set -e
@@ -184,34 +165,35 @@ jobs:
 
           struct ModelReader {
 
-            template <std::integral T>
-            T ReadWeight(int scale) {
+              template <std::integral T>
+              T ReadWeight(int scale) {
 
-                float weight = MODEL_WEIGHTS[index_++];
+                  float weight = MODEL_WEIGHTS[index_++];
 
-                int64_t final_weight =
-                    std::round(weight * scale);
+                  int64_t final_weight =
+                      std::round(weight * scale);
 
-                if (
-                    final_weight >
-                        static_cast<int64_t>(
-                            std::numeric_limits<T>::max())
-                    ||
-                    final_weight <
-                        static_cast<int64_t>(
-                            std::numeric_limits<T>::min())
-                ) {
-                    q_util::ExitWithError(
-                        "Model weights are out of range"
-                    );
-                }
+                  if (
+                      final_weight >
+                          static_cast<int64_t>(
+                              std::numeric_limits<T>::max())
+                      ||
+                      final_weight <
+                          static_cast<int64_t>(
+                              std::numeric_limits<T>::min())
+                  ) {
 
-                return static_cast<T>(final_weight);
-            }
+                      q_util::ExitWithError(
+                          "Model weights are out of range"
+                      );
+                  }
+
+                  return static_cast<T>(final_weight);
+              }
 
           private:
 
-            size_t index_ = 0;
+              size_t index_ = 0;
           };
 
 
@@ -222,403 +204,408 @@ jobs:
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct FeatureLayer {
 
-            void Initialize(ModelReader& reader) {
+              void Initialize(ModelReader& reader) {
 
-                for (size_t i = 0; i < INPUT_SIZE; i++) {
+                  for (size_t i = 0; i < INPUT_SIZE; i++) {
 
-                    for (
-                        size_t j = 0;
-                        j < OUTPUT_SIZE / 2;
-                        j++
-                    ) {
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE / 2;
+                          j++
+                      ) {
 
-                        weights_[i][j] =
-                            reader.ReadWeight<int16_t>(
-                                ACTIVATION_SCALE *
-                                (1 << FEATURE_ADDITIONAL_PRECISION)
-                            );
+                          weights_[i][j] =
+                              reader.ReadWeight<int16_t>(
+                                  ACTIVATION_SCALE *
+                                  (1 << FEATURE_ADDITIONAL_PRECISION)
+                              );
 
-                        const q_core::cell_t cell =
-                            i / q_core::BOARD_SIZE + 1;
+                          const q_core::cell_t cell =
+                              i / q_core::BOARD_SIZE + 1;
 
-                        const q_core::coord_t coord =
-                            i % q_core::BOARD_SIZE;
+                          const q_core::coord_t coord =
+                              i % q_core::BOARD_SIZE;
 
-                        size_t pos =
-                            (
-                                static_cast<size_t>(
-                                    q_core::FlipCellColor(cell)
-                                ) - 1
-                            )
-                            *
-                            q_core::BOARD_SIZE
-                            +
-                            q_core::FlipCoord(coord);
+                          size_t pos =
+                              (
+                                  static_cast<size_t>(
+                                      q_core::FlipCellColor(cell)
+                                  ) - 1
+                              )
+                              *
+                              q_core::BOARD_SIZE
+                              +
+                              q_core::FlipCoord(coord);
 
-                        weights_[pos][j + OUTPUT_SIZE / 2] =
-                            weights_[i][j];
-                    }
-                }
+                          weights_[pos][j + OUTPUT_SIZE / 2] =
+                              weights_[i][j];
+                      }
+                  }
 
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE / 2;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE / 2;
+                      i++
+                  ) {
 
-                    biases_[i] =
-                        reader.ReadWeight<int16_t>(
-                            ACTIVATION_SCALE *
-                            (1 << FEATURE_ADDITIONAL_PRECISION)
-                        );
+                      biases_[i] =
+                          reader.ReadWeight<int16_t>(
+                              ACTIVATION_SCALE *
+                              (1 << FEATURE_ADDITIONAL_PRECISION)
+                          );
 
-                    biases_[i + OUTPUT_SIZE / 2] =
-                        biases_[i];
-                }
-            }
-
-
-            void GetResultOnEmptyBoard(int16_t* output) {
-
-                std::copy(
-                    biases_.begin(),
-                    biases_.end(),
-                    output
-                );
-            }
+                      biases_[i + OUTPUT_SIZE / 2] =
+                          biases_[i];
+                  }
+              }
 
 
-            void Update(
-                int16_t* input,
-                size_t position,
-                int8_t delta
-            ) {
+              void GetResultOnEmptyBoard(int16_t* output) {
 
-                const int16_t* weights =
-                    weights_[position].data();
-
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE;
-                    i++
-                ) {
-
-                    uint16_t value =
-                        static_cast<uint16_t>(input[i]);
-
-                    uint16_t weight =
-                        static_cast<uint16_t>(weights[i]);
-
-                    if (delta == -1) {
-
-                        value =
-                            static_cast<uint16_t>(
-                                value - weight
-                            );
-
-                    } else {
-
-                        value =
-                            static_cast<uint16_t>(
-                                value + weight
-                            );
-                    }
-
-                    input[i] =
-                        static_cast<int16_t>(value);
-                }
-            }
+                  std::copy(
+                      biases_.begin(),
+                      biases_.end(),
+                      output
+                  );
+              }
 
 
-            void Add(
-                int16_t* input,
-                size_t position
-            ) {
+              void Update(
+                  int16_t* input,
+                  size_t position,
+                  int8_t delta
+              ) {
 
-                const int16_t* weights =
-                    weights_[position].data();
+                  const int16_t* weights =
+                      weights_[position].data();
 
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
 
-                    uint16_t value =
-                        static_cast<uint16_t>(input[i]);
+                      uint16_t value =
+                          static_cast<uint16_t>(
+                              input[i]
+                          );
 
-                    value =
-                        static_cast<uint16_t>(
-                            value +
-                            static_cast<uint16_t>(weights[i])
-                        );
+                      uint16_t weight =
+                          static_cast<uint16_t>(
+                              weights[i]
+                          );
 
-                    input[i] =
-                        static_cast<int16_t>(value);
-                }
-            }
+                      if (delta == -1) {
 
+                          value =
+                              static_cast<uint16_t>(
+                                  value - weight
+                              );
 
-            void SubAdd(
-                int16_t* input,
-                size_t position_first,
-                size_t position_second
-            ) {
+                      } else {
 
-                const int16_t* first =
-                    weights_[position_first].data();
+                          value =
+                              static_cast<uint16_t>(
+                                  value + weight
+                              );
+                      }
 
-                const int16_t* second =
-                    weights_[position_second].data();
-
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE;
-                    i++
-                ) {
-
-                    uint16_t value =
-                        static_cast<uint16_t>(input[i]);
-
-                    value =
-                        static_cast<uint16_t>(
-                            value -
-                            static_cast<uint16_t>(first[i])
-                        );
-
-                    value =
-                        static_cast<uint16_t>(
-                            value +
-                            static_cast<uint16_t>(second[i])
-                        );
-
-                    input[i] =
-                        static_cast<int16_t>(value);
-                }
-            }
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
 
 
-            void SubSubAdd(
-                int16_t* input,
-                size_t position_first,
-                size_t position_second,
-                size_t position_third
-            ) {
+              void Add(
+                  int16_t* input,
+                  size_t position
+              ) {
 
-                const int16_t* first =
-                    weights_[position_first].data();
+                  const int16_t* weights =
+                      weights_[position].data();
 
-                const int16_t* second =
-                    weights_[position_second].data();
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
 
-                const int16_t* third =
-                    weights_[position_third].data();
+                      uint16_t value =
+                          static_cast<uint16_t>(
+                              input[i]
+                          );
 
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE;
-                    i++
-                ) {
+                      value =
+                          static_cast<uint16_t>(
+                              value +
+                              static_cast<uint16_t>(
+                                  weights[i]
+                              )
+                          );
 
-                    uint16_t value =
-                        static_cast<uint16_t>(input[i]);
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
 
-                    value =
-                        static_cast<uint16_t>(
-                            value -
-                            static_cast<uint16_t>(first[i])
-                        );
 
-                    value =
-                        static_cast<uint16_t>(
-                            value -
-                            static_cast<uint16_t>(second[i])
-                        );
+              void SubAdd(
+                  int16_t* input,
+                  size_t position_first,
+                  size_t position_second
+              ) {
 
-                    value =
-                        static_cast<uint16_t>(
-                            value +
-                            static_cast<uint16_t>(third[i])
-                        );
+                  const int16_t* first =
+                      weights_[position_first].data();
 
-                    input[i] =
-                        static_cast<int16_t>(value);
-                }
-            }
+                  const int16_t* second =
+                      weights_[position_second].data();
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      uint16_t value =
+                          static_cast<uint16_t>(
+                              input[i]
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value -
+                              static_cast<uint16_t>(
+                                  first[i]
+                              )
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value +
+                              static_cast<uint16_t>(
+                                  second[i]
+                              )
+                          );
+
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
+
+
+              void SubSubAdd(
+                  int16_t* input,
+                  size_t position_first,
+                  size_t position_second,
+                  size_t position_third
+              ) {
+
+                  const int16_t* first =
+                      weights_[position_first].data();
+
+                  const int16_t* second =
+                      weights_[position_second].data();
+
+                  const int16_t* third =
+                      weights_[position_third].data();
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      uint16_t value =
+                          static_cast<uint16_t>(
+                              input[i]
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value -
+                              static_cast<uint16_t>(
+                                  first[i]
+                              )
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value -
+                              static_cast<uint16_t>(
+                                  second[i]
+                              )
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value +
+                              static_cast<uint16_t>(
+                                  third[i]
+                              )
+                          );
+
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
 
 
           private:
 
-            alignas(64)
-            std::array<
-                std::array<int16_t, OUTPUT_SIZE>,
-                INPUT_SIZE
-            > weights_;
+              alignas(64)
+              std::array<
+                  std::array<int16_t, OUTPUT_SIZE>,
+                  INPUT_SIZE
+              > weights_;
 
-            alignas(64)
-            std::array<int16_t, OUTPUT_SIZE> biases_;
+              alignas(64)
+              std::array<
+                  int16_t,
+                  OUTPUT_SIZE
+              > biases_;
           };
 
 
           // ==========================================================
-          // FIRST LINEAR LAYER
+          // LINEAR LAYER
           // ==========================================================
 
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct LinearLayer {
 
-            void Initialize(ModelReader& reader) {
+              void Initialize(ModelReader& reader) {
 
-                for (
-                    size_t i = 0;
-                    i < INPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
 
-                    for (
-                        size_t j = 0;
-                        j < OUTPUT_SIZE;
-                        j++
-                    ) {
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE;
+                          j++
+                      ) {
 
-                        weights_[
-                            GetWeightIndex(
-                                static_cast<int>(
-                                    j * INPUT_SIZE + i
-                                )
-                            )
-                        ] =
-                            reader.ReadWeight<int8_t>(
-                                WEIGHT_SCALE *
-                                (1 << LINEAR_ADDITIONAL_PRECISION)
-                            );
-                    }
-                }
+                          weights_[
+                              GetWeightIndex(
+                                  static_cast<int>(
+                                      j * INPUT_SIZE + i
+                                  )
+                              )
+                          ] =
+                              reader.ReadWeight<int8_t>(
+                                  WEIGHT_SCALE *
+                                  (1 << LINEAR_ADDITIONAL_PRECISION)
+                              );
+                      }
+                  }
 
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
 
-                    biases_[i] =
-                        reader.ReadWeight<int32_t>(
-                            ACTIVATION_SCALE *
-                            WEIGHT_SCALE *
-                            (1 << LINEAR_ADDITIONAL_PRECISION)
-                        );
-                }
-            }
+                      biases_[i] =
+                          reader.ReadWeight<int32_t>(
+                              ACTIVATION_SCALE *
+                              WEIGHT_SCALE *
+                              (1 << LINEAR_ADDITIONAL_PRECISION)
+                          );
+                  }
+              }
 
 
-            void Process(
-                const int8_t* src,
-                int32_t* dest
-            ) {
+              void Process(
+                  const int8_t* src,
+                  int32_t* dest
+              ) {
 
-                for (
-                    size_t output = 0;
-                    output < OUTPUT_SIZE;
-                    output++
-                ) {
+                  for (
+                      size_t output = 0;
+                      output < OUTPUT_SIZE;
+                      output++
+                  ) {
 
-                    /*
-                     * ClippedReLU16 produces unsigned activation
-                     * values in the range 0..127.
-                     *
-                     * The original AVX2 implementation uses
-                     * _mm256_maddubs_epi16, which multiplies
-                     * unsigned bytes by signed int8 weights.
-                     *
-                     * This scalar loop performs the same
-                     * mathematical operation.
-                     */
+                      int64_t sum =
+                          biases_[output];
 
-                    uint32_t sum =
-                        static_cast<uint32_t>(
-                            biases_[output]
-                        );
+                      for (
+                          size_t input = 0;
+                          input < INPUT_SIZE;
+                          input++
+                      ) {
 
-                    for (
-                        size_t input = 0;
-                        input < INPUT_SIZE;
-                        input++
-                    ) {
+                          const uint8_t activation =
+                              static_cast<uint8_t>(
+                                  src[input]
+                              );
 
-                        const uint8_t activation =
-                            static_cast<uint8_t>(
-                                src[input]
-                            );
+                          const int8_t weight =
+                              weights_[
+                                  GetWeightIndex(
+                                      static_cast<int>(
+                                          output *
+                                          INPUT_SIZE +
+                                          input
+                                      )
+                                  )
+                              ];
 
-                        if (activation == 0)
-                            continue;
+                          sum +=
+                              static_cast<int64_t>(
+                                  activation
+                              )
+                              *
+                              static_cast<int64_t>(
+                                  weight
+                              );
+                      }
 
-                        const int8_t weight =
-                            weights_[
-                                GetWeightIndex(
-                                    static_cast<int>(
-                                        output *
-                                        INPUT_SIZE +
-                                        input
-                                    )
-                                )
-                            ];
-
-                        const int64_t product =
-                            static_cast<int64_t>(
-                                activation
-                            )
-                            *
-                            static_cast<int64_t>(
-                                weight
-                            );
-
-                        sum +=
-                            static_cast<uint32_t>(
-                                product
-                            );
-                    }
-
-                    dest[output] =
-                        static_cast<int32_t>(
-                            sum >>
-                            LINEAR_ADDITIONAL_PRECISION
-                        );
-                }
-            }
+                      dest[output] =
+                          static_cast<int32_t>(
+                              sum >>
+                              LINEAR_ADDITIONAL_PRECISION
+                          );
+                  }
+              }
 
 
           private:
 
-            static constexpr int GetWeightIndex(int idx) {
+              static constexpr int GetWeightIndex(
+                  int idx
+              ) {
 
-                return
-                    (
-                        (idx / 4)
-                        %
-                        (INPUT_SIZE / 4)
-                        *
-                        OUTPUT_SIZE *
-                        4
-                    )
-                    +
-                    (idx / INPUT_SIZE * 4)
-                    +
-                    (idx % 4);
-            }
+                  return
+                      (
+                          (idx / 4)
+                          %
+                          (INPUT_SIZE / 4)
+                          *
+                          OUTPUT_SIZE *
+                          4
+                      )
+                      +
+                      (idx / INPUT_SIZE * 4)
+                      +
+                      (idx % 4);
+              }
 
 
-            alignas(64)
-            std::array<
-                int8_t,
-                INPUT_SIZE * OUTPUT_SIZE
-            > weights_;
+              alignas(64)
+              std::array<
+                  int8_t,
+                  INPUT_SIZE * OUTPUT_SIZE
+              > weights_;
 
-            alignas(64)
-            std::array<
-                int32_t,
-                OUTPUT_SIZE
-            > biases_;
+              alignas(64)
+              std::array<
+                  int32_t,
+                  OUTPUT_SIZE
+              > biases_;
           };
 
 
@@ -629,109 +616,111 @@ jobs:
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct PreciseLinearLayer {
 
-            void Initialize(ModelReader& reader) {
+              void Initialize(ModelReader& reader) {
 
-                for (
-                    size_t i = 0;
-                    i < INPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
 
-                    for (
-                        size_t j = 0;
-                        j < OUTPUT_SIZE;
-                        j++
-                    ) {
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE;
+                          j++
+                      ) {
 
-                        weights_[
-                            j * INPUT_SIZE + i
-                        ] =
-                            reader.ReadWeight<int16_t>(
-                                WEIGHT_SCALE *
-                                PRECISE_WEIGHT_SCALE
-                            );
-                    }
-                }
+                          weights_[
+                              j * INPUT_SIZE + i
+                          ] =
+                              reader.ReadWeight<int16_t>(
+                                  WEIGHT_SCALE *
+                                  PRECISE_WEIGHT_SCALE
+                              );
+                      }
+                  }
 
-                for (
-                    size_t i = 0;
-                    i < OUTPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
 
-                    biases_[i] =
-                        reader.ReadWeight<int32_t>(
-                            ACTIVATION_SCALE *
-                            WEIGHT_SCALE *
-                            WEIGHT_SCALE *
-                            PRECISE_WEIGHT_SCALE
-                        );
-                }
-            }
+                      biases_[i] =
+                          reader.ReadWeight<int32_t>(
+                              ACTIVATION_SCALE *
+                              WEIGHT_SCALE *
+                              WEIGHT_SCALE *
+                              PRECISE_WEIGHT_SCALE
+                          );
+                  }
+              }
 
 
-            void Process(
-                const int16_t* input,
-                int32_t* output
-            ) {
+              void Process(
+                  const int16_t* input,
+                  int32_t* output
+              ) {
 
-                constexpr int SHIFT =
-                    q_util::GetHighestBit(
-                        static_cast<uint32_t>(
-                            WEIGHT_SCALE *
-                            PRECISE_WEIGHT_SCALE
-                        )
-                    );
+                  constexpr int SHIFT =
+                      q_util::GetHighestBit(
+                          static_cast<uint32_t>(
+                              WEIGHT_SCALE *
+                              PRECISE_WEIGHT_SCALE
+                          )
+                      );
 
-                for (
-                    size_t out = 0;
-                    out < OUTPUT_SIZE;
-                    out++
-                ) {
+                  for (
+                      size_t out = 0;
+                      out < OUTPUT_SIZE;
+                      out++
+                  ) {
 
-                    int64_t sum =
-                        biases_[out];
+                      int64_t sum =
+                          biases_[out];
 
-                    const size_t offset =
-                        out * INPUT_SIZE;
+                      const size_t offset =
+                          out * INPUT_SIZE;
 
-                    for (
-                        size_t i = 0;
-                        i < INPUT_SIZE;
-                        i++
-                    ) {
+                      for (
+                          size_t i = 0;
+                          i < INPUT_SIZE;
+                          i++
+                      ) {
 
-                        sum +=
-                            static_cast<int64_t>(
-                                input[i]
-                            )
-                            *
-                            static_cast<int64_t>(
-                                weights_[offset + i]
-                            );
-                    }
+                          sum +=
+                              static_cast<int64_t>(
+                                  input[i]
+                              )
+                              *
+                              static_cast<int64_t>(
+                                  weights_[
+                                      offset + i
+                                  ]
+                              );
+                      }
 
-                    output[out] =
-                        static_cast<int32_t>(
-                            sum >> SHIFT
-                        );
-                }
-            }
+                      output[out] =
+                          static_cast<int32_t>(
+                              sum >> SHIFT
+                          );
+                  }
+              }
 
 
           private:
 
-            alignas(64)
-            std::array<
-                int16_t,
-                INPUT_SIZE * OUTPUT_SIZE
-            > weights_;
+              alignas(64)
+              std::array<
+                  int16_t,
+                  INPUT_SIZE * OUTPUT_SIZE
+              > weights_;
 
-            alignas(64)
-            std::array<
-                int32_t,
-                OUTPUT_SIZE
-            > biases_;
+              alignas(64)
+              std::array<
+                  int32_t,
+                  OUTPUT_SIZE
+              > biases_;
           };
 
 
@@ -742,70 +731,71 @@ jobs:
           template <size_t INPUT_SIZE>
           struct OutputLayer {
 
-            void Initialize(ModelReader& reader) {
+              void Initialize(ModelReader& reader) {
 
-                for (
-                    size_t i = 0;
-                    i < INPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
 
-                    weights_[i] =
-                        reader.ReadWeight<int16_t>(
-                            WEIGHT_SCALE *
-                            OUTPUT_SCALE /
-                            ACTIVATION_SCALE
-                        );
-                }
+                      weights_[i] =
+                          reader.ReadWeight<int16_t>(
+                              WEIGHT_SCALE *
+                              OUTPUT_SCALE /
+                              ACTIVATION_SCALE
+                          );
+                  }
 
-                bias_ =
-                    reader.ReadWeight<int32_t>(
-                        WEIGHT_SCALE *
-                        OUTPUT_SCALE
-                    );
-            }
+                  bias_ =
+                      reader.ReadWeight<int32_t>(
+                          WEIGHT_SCALE *
+                          OUTPUT_SCALE
+                      );
+              }
 
 
-            int32_t Process(
-                const int16_t* input
-            ) {
+              int32_t Process(
+                  const int16_t* input
+              ) {
 
-                int64_t ans = bias_;
+                  int64_t ans =
+                      bias_;
 
-                for (
-                    uint16_t i = 0;
-                    i < INPUT_SIZE;
-                    i++
-                ) {
+                  for (
+                      uint16_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
 
-                    ans +=
-                        static_cast<int64_t>(
-                            input[i]
-                        )
-                        *
-                        static_cast<int64_t>(
-                            weights_[i]
-                        );
-                }
+                      ans +=
+                          static_cast<int64_t>(
+                              input[i]
+                          )
+                          *
+                          static_cast<int64_t>(
+                              weights_[i]
+                          );
+                  }
 
-                return static_cast<int32_t>(ans);
-            }
+                  return static_cast<int32_t>(ans);
+              }
 
 
           private:
 
-            alignas(64)
-            std::array<
-                int16_t,
-                INPUT_SIZE
-            > weights_;
+              alignas(64)
+              std::array<
+                  int16_t,
+                  INPUT_SIZE
+              > weights_;
 
-            int32_t bias_;
+              int32_t bias_;
           };
 
 
           // ==========================================================
-          // CLIPPED RELU 16 -> INT8
+          // ACTIVATION FUNCTIONS
           // ==========================================================
 
           inline void ClippedReLU16(
@@ -840,10 +830,6 @@ jobs:
               }
           }
 
-
-          // ==========================================================
-          // CLIPPED RELU 32 -> INT16
-          // ==========================================================
 
           inline void ClippedReLU32(
               int size,
@@ -882,7 +868,7 @@ jobs:
 
           }  // namespace q_eval
 
-          #endif  // QUIRKY_SRC_EVAL_LAYERS_H
+          #endif
           EOF
 
           echo "ARM-safe layers.h installed."
@@ -896,6 +882,8 @@ jobs:
         run: |
           set -e
 
+          echo "===== Checking layers.h ====="
+
           if grep -nE \
             '#include <immintrin.h>|__m256|__m128|_mm256_|_mm_' \
             src/eval/layers.h ; then
@@ -904,29 +892,11 @@ jobs:
             exit 1
           fi
 
-          echo "OK: no x86 intrinsics in layers.h."
+          echo "OK: layers.h contains no x86 intrinsic names."
 
 
       # ============================================================
       # PATCH SEARCH THREADING
-      #
-      # Original source has:
-      #
-      #   std::thread -> StartMainThread()
-      #
-      # and inside:
-      #
-      #   Searcher searcher(...)
-      #   std::thread -> searcher.Run(...)
-      #
-      # The Android crash showed a pthread stack overflow.
-      #
-      # We therefore:
-      #
-      #   Launcher thread = 16 MB
-      #   Search thread  = 32 MB
-      #
-      # and put Searcher on the heap.
       # ============================================================
       - name: Patch pthread search threads
         shell: bash
@@ -952,25 +922,23 @@ jobs:
           # HEADER
           # ========================================================
 
-          old_header = """#include <thread>"""
-
-          if old_header not in h:
+          if '#include <thread>' not in h:
               raise SystemExit(
                   "ERROR: launcher.h does not contain <thread>"
               )
 
           h = h.replace(
-              old_header,
-              "#include <pthread.h>",
+              '#include <thread>',
+              '#include <pthread.h>',
               1
           )
 
 
-          old_member = """    std::thread thread_;"""
+          old_member = '    std::thread thread_;'
 
-          new_member = """    pthread_t thread_{};
+          new_member = '''    pthread_t thread_{};
               bool thread_joinable_ = false;
-              static void* LauncherThreadEntry(void* raw);"""
+              static void* LauncherThreadEntry(void* raw);'''
 
           if old_member not in h:
               raise SystemExit(
@@ -987,43 +955,38 @@ jobs:
 
 
           # ========================================================
-          # CPP INCLUDES
+          # INCLUDES
           # ========================================================
 
-          include_marker = """#include "launcher.h"
+          marker = '''#include "launcher.h"
 
-          #include <string>"""
+          #include <string>'''
 
-          if include_marker not in c:
+          if marker not in c:
               raise SystemExit(
                   "ERROR: launcher.cpp include block not found"
               )
 
           c = c.replace(
-              include_marker,
-              """#include "launcher.h"
+              marker,
+              '''#include "launcher.h"
 
           #include <memory>
           #include <pthread.h>
-          #include <string>""",
+          #include <string>''',
               1
           )
 
 
           # ========================================================
-          # HELPER CODE
+          # THREAD HELPERS
           # ========================================================
 
-          namespace_marker = """namespace q_search {
+          marker = '''namespace q_search {
 
-          uint8_t GetRTByteSizeLog"""
+          uint8_t GetRTByteSizeLog'''
 
-          if namespace_marker not in c:
-              raise SystemExit(
-                  "ERROR: namespace marker not found"
-              )
-
-          helper = """namespace q_search {
+          replacement = '''namespace q_search {
 
           namespace {
 
@@ -1084,6 +1047,7 @@ jobs:
                       stack_size
                   ) != 0
               ) {
+
                   pthread_attr_destroy(&attr);
                   return false;
               }
@@ -1104,20 +1068,25 @@ jobs:
           }  // namespace
 
 
-          uint8_t GetRTByteSizeLog"""
+          uint8_t GetRTByteSizeLog'''
+
+          if marker not in c:
+              raise SystemExit(
+                  "ERROR: namespace marker not found"
+              )
 
           c = c.replace(
-              namespace_marker,
-              helper,
+              marker,
+              replacement,
               1
           )
 
 
           # ========================================================
-          # SEARCHLAUNCHER::START
+          # START
           # ========================================================
 
-          old_start = """void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
+          old_start = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
                                              time_control_t time_control, depth_t max_depth) {
               Join();
               control_.Reset();
@@ -1125,9 +1094,9 @@ jobs:
               thread_ = std::thread([this, board, moves, time_control, max_depth]() {
                   StartMainThread(board, moves, time_control, max_depth);
               });
-          }"""
+          }'''
 
-          new_start = """void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
+          new_start = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
                                              time_control_t time_control, depth_t max_depth) {
               Join();
               control_.Reset();
@@ -1150,18 +1119,20 @@ jobs:
 
                   delete args;
                   thread_joinable_ = false;
+
                   q_util::PrintError(
                       "Failed to create launcher pthread"
                   );
+
                   return;
               }
 
               thread_joinable_ = true;
-          }"""
+          }'''
 
           if old_start not in c:
               raise SystemExit(
-                  "ERROR: original SearchLauncher::Start block not found"
+                  "ERROR: original Start() block not found"
               )
 
           c = c.replace(
@@ -1175,9 +1146,9 @@ jobs:
           # LAUNCHER THREAD ENTRY
           # ========================================================
 
-          entry_marker = """uint64_t GetNPS"""
+          marker = 'uint64_t GetNPS'
 
-          launcher_entry = """void* SearchLauncher::LauncherThreadEntry(void* raw) {
+          replacement = '''void* SearchLauncher::LauncherThreadEntry(void* raw) {
 
               auto* args =
                   static_cast<LauncherThreadArgs*>(raw);
@@ -1195,30 +1166,30 @@ jobs:
           }
 
 
-          uint64_t GetNPS"""
+          uint64_t GetNPS'''
 
-          if entry_marker not in c:
+          if marker not in c:
               raise SystemExit(
                   "ERROR: GetNPS marker not found"
               )
 
           c = c.replace(
-              entry_marker,
-              launcher_entry,
+              marker,
+              replacement,
               1
           )
 
 
           # ========================================================
-          # SEARCHER ON HEAP + PTHREAD
+          # SEARCH THREAD
           # ========================================================
 
-          old_search = """    SearchStat stat;
+          old_search = '''    SearchStat stat;
               Searcher searcher(tt_, rt, board, control_, stat);
               SearchTimer timer(time_control, board, stat);
-              std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });"""
+              std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });'''
 
-          new_search = """    SearchStat stat;
+          new_search = '''    SearchStat stat;
 
               auto searcher =
                   std::make_unique<Searcher>(
@@ -1251,11 +1222,13 @@ jobs:
                       search_args)) {
 
                   delete search_args;
+
                   q_util::PrintError(
                       "Failed to create search pthread"
                   );
+
                   return;
-              }"""
+              }'''
 
           if old_search not in c:
               raise SystemExit(
@@ -1270,15 +1243,15 @@ jobs:
 
 
           # ========================================================
-          # SEARCH THREAD JOIN
+          # SEARCH JOIN
           # ========================================================
 
-          old_join = """    search_thread.join();"""
+          old_join = '    search_thread.join();'
 
-          new_join = """    pthread_join(
+          new_join = '''    pthread_join(
                   search_thread,
                   nullptr
-              );"""
+              );'''
 
           if old_join not in c:
               raise SystemExit(
@@ -1296,15 +1269,16 @@ jobs:
           # LAUNCHER JOIN
           # ========================================================
 
-          old_launcher_join = """void SearchLauncher::Join() {
+          old_join = '''void SearchLauncher::Join() {
               if (thread_.joinable()) {
                   control_.Stop();
                   thread_.join();
               }
-          }"""
+          }'''
 
-          new_launcher_join = """void SearchLauncher::Join() {
+          new_join = '''void SearchLauncher::Join() {
               if (thread_joinable_) {
+
                   control_.Stop();
 
                   pthread_join(
@@ -1314,16 +1288,16 @@ jobs:
 
                   thread_joinable_ = false;
               }
-          }"""
+          }'''
 
-          if old_launcher_join not in c:
+          if old_join not in c:
               raise SystemExit(
                   "ERROR: original Join() block not found"
               )
 
           c = c.replace(
-              old_launcher_join,
-              new_launcher_join,
+              old_join,
+              new_join,
               1
           )
 
@@ -1332,9 +1306,9 @@ jobs:
           # FINAL CHECK
           # ========================================================
 
-          if "std::thread" in c:
+          if 'std::thread' in c:
               raise SystemExit(
-                  "ERROR: std::thread still remains in launcher.cpp"
+                  "ERROR: std::thread remains in launcher.cpp"
               )
 
           source.write_text(c)
@@ -1381,7 +1355,7 @@ jobs:
 
 
       # ============================================================
-      # CLEAN BUILD
+      # CLEAN CONFIGURE
       # ============================================================
       - name: Configure ARM64 build
         shell: bash
@@ -1411,7 +1385,7 @@ jobs:
 
 
       # ============================================================
-      # VERIFY GENERATED FLAGS
+      # VERIFY GENERATED BUILD FLAGS
       # ============================================================
       - name: Verify generated Ninja flags
         shell: bash
@@ -1420,10 +1394,12 @@ jobs:
 
           echo "===== GENERATED FLAGS ====="
 
-          grep -n "FLAGS =" build/build.ninja | head -50 || true
+          grep -n "FLAGS =" \
+            build/build.ninja \
+            | head -50 || true
 
           echo
-          echo "===== X86 FLAG CHECK ====="
+          echo "===== X86 FLAGS ====="
 
           if grep -nE \
             '(^|[[:space:]])-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)([[:space:]]|$)' \
@@ -1433,14 +1409,18 @@ jobs:
             exit 1
           fi
 
+          echo
+          echo "===== NUMERIC FRAGMENTS ====="
+
           if grep -nE \
             '(^|[[:space:]])(2|3|4\.1|4\.2)([[:space:]]|$)' \
             build/build.ninja ; then
 
-            echo "ERROR: standalone numeric fragments reached build.ninja"
+            echo "ERROR: malformed numeric fragments reached build.ninja"
             exit 1
           fi
 
+          echo
           echo "OK: generated flags are clean."
 
 
@@ -1456,7 +1436,7 @@ jobs:
 
 
       # ============================================================
-      # FIND QUIRKY EXECUTABLE
+      # FIND EXECUTABLE
       # ============================================================
       - name: Find Quirky executable
         shell: bash
@@ -1502,7 +1482,7 @@ jobs:
           file "$BIN"
 
           echo
-          echo "===== ELF ====="
+          echo "===== ELF HEADER ====="
 
           readelf -h "$BIN" | grep -E \
             'Class:|Machine:|Type:'
@@ -1536,7 +1516,7 @@ jobs:
 
 
       # ============================================================
-      # UPLOAD ARTIFACT
+      # UPLOAD
       # ============================================================
       - name: Upload ARM64 binary
         uses: actions/upload-artifact@v4
