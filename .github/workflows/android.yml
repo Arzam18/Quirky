@@ -8,9 +8,17 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
       - name: Checkout
         uses: actions/checkout@v4
 
+
+      # ============================================================
+      # FIND ANDROID NDK
+      # ============================================================
       - name: Find Android NDK
         shell: bash
         run: |
@@ -28,16 +36,19 @@ jobs:
             exit 1
           fi
 
-          echo "NDK=$NDK"
+          echo "Using NDK:"
+          echo "$NDK"
+
           echo "NDK=$NDK" >> "$GITHUB_ENV"
 
           echo "TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" \
             >> "$GITHUB_ENV"
 
+
       # ============================================================
-      # Remove x86 compiler flags
+      # REMOVE X86 FLAGS FROM CMAKE
       # ============================================================
-      - name: Remove x86 flags
+      - name: Remove x86 compiler flags
         shell: bash
         run: |
           set -e
@@ -64,20 +75,24 @@ jobs:
               "-mxop",
           ]
 
-          for p in Path(".").rglob("*"):
-              if not p.is_file():
+          for path in Path(".").rglob("*"):
+
+              if not path.is_file():
                   continue
 
-              if p.name != "CMakeLists.txt" and p.suffix != ".cmake":
+              if path.name != "CMakeLists.txt" and path.suffix != ".cmake":
                   continue
 
               try:
-                  text = p.read_text()
+                  text = path.read_text()
               except Exception:
                   continue
 
               original = text
 
+              # Remove complete compiler flag tokens.
+              # Longest first prevents -msse from matching
+              # the beginning of -msse2, -msse3, etc.
               for flag in sorted(bad_flags, key=len, reverse=True):
                   text = re.sub(
                       rf"(?<![A-Za-z0-9_]){re.escape(flag)}(?![A-Za-z0-9_.-])",
@@ -85,12 +100,20 @@ jobs:
                       text
                   )
 
+              # Remove numeric fragments accidentally produced by
+              # earlier broken flag replacements.
               lines = []
 
               for line in text.splitlines():
-                  if "CMAKE_CXX_FLAGS" in line or "CMAKE_C_FLAGS" in line:
+
+                  if (
+                      "CMAKE_CXX_FLAGS" in line
+                      or "CMAKE_C_FLAGS" in line
+                  ):
                       line = re.sub(
-                          r"(?<![A-Za-z0-9_.-])(?:2|3|4\.1|4\.2)(?![A-Za-z0-9_.-])",
+                          r"(?<![A-Za-z0-9_.-])"
+                          r"(?:2|3|4\.1|4\.2)"
+                          r"(?![A-Za-z0-9_.-])",
                           "",
                           line
                       )
@@ -103,18 +126,22 @@ jobs:
                   text += "\n"
 
               if text != original:
-                  p.write_text(text)
-                  print("PATCHED:", p)
+                  path.write_text(text)
+                  print("PATCHED:", path)
 
           PY
 
+
+      # ============================================================
+      # VERIFY CMAKE FLAGS
+      # ============================================================
       - name: Verify CMake flags
         shell: bash
         run: |
           set -e
 
           echo "========================================"
-          echo "CMAKE FLAGS"
+          echo "CMAKE FLAG LINES"
           echo "========================================"
 
           grep -RIn \
@@ -134,16 +161,774 @@ jobs:
             '-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)' \
             . ; then
 
-            echo "ERROR: x86 flags remain."
+            echo "ERROR: x86 compiler flags remain."
             exit 1
           fi
 
-          echo "OK: no x86 flags."
+          echo "OK: no x86 compiler flags remain."
+
 
       # ============================================================
-      # Configure ARM64
+      # REPLACE THE AVX2 NNUE LAYERS
+      #
+      # The original Quirky layers.h directly uses:
+      #
+      #   <immintrin.h>
+      #   __m256i
+      #   _mm256_*
+      #
+      # Those are x86/AVX2 instructions.
+      #
+      # For the first Android build we use a scalar implementation
+      # with the same layer interfaces and weight layout.
+      #
+      # This is a CORRECTNESS build first.
+      # NEON optimization can be done after it works.
       # ============================================================
-      - name: Configure ARM64
+      - name: Replace AVX2 NNUE layers with ARM-safe implementation
+        shell: bash
+        run: |
+          set -e
+
+          cat > src/eval/layers.h <<'EOF'
+          #ifndef QUIRKY_SRC_EVAL_LAYERS_H
+          #define QUIRKY_SRC_EVAL_LAYERS_H
+
+          #include <algorithm>
+          #include <array>
+          #include <cmath>
+          #include <concepts>
+          #include <cstddef>
+          #include <cstdint>
+          #include <limits>
+
+          #include "core/board/types.h"
+          #include "core/util.h"
+          #include "model_weights.h"
+          #include "util/bit.h"
+          #include "util/io.h"
+
+          namespace q_eval {
+
+          static constexpr int WEIGHT_SCALE = 64;
+          static constexpr int ACTIVATION_SCALE = 127;
+          static constexpr int OUTPUT_SCALE = 64 * 64;
+          static constexpr int PRECISE_WEIGHT_SCALE = 64;
+
+          static constexpr uint8_t FEATURE_ADDITIONAL_PRECISION = 5;
+          static constexpr uint8_t LINEAR_ADDITIONAL_PRECISION = 3;
+
+
+          struct ModelReader {
+
+            public:
+
+              template <std::integral T>
+              T ReadWeight(int scale) {
+
+                  float weight = MODEL_WEIGHTS[index_++];
+
+                  int64_t final_weight =
+                      std::round(weight * scale);
+
+                  if (
+                      final_weight >
+                          static_cast<int64_t>(
+                              std::numeric_limits<T>::max())
+                      ||
+                      final_weight <
+                          static_cast<int64_t>(
+                              std::numeric_limits<T>::min())
+                  ) {
+                      q_util::ExitWithError(
+                          "Model weights are out of range"
+                      );
+                  }
+
+                  return static_cast<T>(final_weight);
+              }
+
+            private:
+
+              size_t index_ = 0;
+          };
+
+
+          // ==========================================================
+          // FEATURE LAYER
+          // ==========================================================
+
+          template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
+          struct FeatureLayer {
+
+            public:
+
+              void Initialize(ModelReader& reader) {
+
+                  for (size_t i = 0; i < INPUT_SIZE; i++) {
+
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE / 2;
+                          j++
+                      ) {
+
+                          weights_[i][j] =
+                              reader.ReadWeight<int16_t>(
+                                  ACTIVATION_SCALE *
+                                  (1 << FEATURE_ADDITIONAL_PRECISION)
+                              );
+
+                          const q_core::cell_t cell =
+                              i / q_core::BOARD_SIZE + 1;
+
+                          const q_core::coord_t coord =
+                              i % q_core::BOARD_SIZE;
+
+                          size_t pos =
+                              (
+                                  static_cast<size_t>(
+                                      q_core::FlipCellColor(cell)
+                                  ) - 1
+                              )
+                              *
+                              q_core::BOARD_SIZE
+                              +
+                              q_core::FlipCoord(coord);
+
+                          weights_[pos]
+                                  [j + OUTPUT_SIZE / 2] =
+                              weights_[i][j];
+                      }
+                  }
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE / 2;
+                      i++
+                  ) {
+
+                      biases_[i] =
+                          reader.ReadWeight<int16_t>(
+                              ACTIVATION_SCALE *
+                              (1 << FEATURE_ADDITIONAL_PRECISION)
+                          );
+
+                      biases_[i + OUTPUT_SIZE / 2] =
+                          biases_[i];
+                  }
+              }
+
+
+              void GetResultOnEmptyBoard(int16_t* output) {
+
+                  std::copy(
+                      biases_.begin(),
+                      biases_.end(),
+                      output
+                  );
+              }
+
+
+              void Update(
+                  int16_t* input,
+                  size_t position,
+                  int8_t delta
+              ) {
+
+                  const int16_t* weights =
+                      weights_[position].data();
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      uint16_t value =
+                          static_cast<uint16_t>(input[i]);
+
+                      uint16_t weight =
+                          static_cast<uint16_t>(weights[i]);
+
+                      if (delta == -1) {
+
+                          value =
+                              static_cast<uint16_t>(
+                                  value - weight
+                              );
+
+                      } else {
+
+                          value =
+                              static_cast<uint16_t>(
+                                  value + weight
+                              );
+                      }
+
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
+
+
+              void Add(
+                  int16_t* input,
+                  size_t position
+              ) {
+
+                  const int16_t* weights =
+                      weights_[position].data();
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      uint16_t value =
+                          static_cast<uint16_t>(input[i]);
+
+                      uint16_t weight =
+                          static_cast<uint16_t>(weights[i]);
+
+                      value =
+                          static_cast<uint16_t>(
+                              value + weight
+                          );
+
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
+
+
+              void SubAdd(
+                  int16_t* input,
+                  size_t position_first,
+                  size_t position_second
+              ) {
+
+                  const int16_t* first =
+                      weights_[position_first].data();
+
+                  const int16_t* second =
+                      weights_[position_second].data();
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      uint16_t value =
+                          static_cast<uint16_t>(input[i]);
+
+                      value =
+                          static_cast<uint16_t>(
+                              value -
+                              static_cast<uint16_t>(first[i])
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value +
+                              static_cast<uint16_t>(second[i])
+                          );
+
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
+
+
+              void SubSubAdd(
+                  int16_t* input,
+                  size_t position_first,
+                  size_t position_second,
+                  size_t position_third
+              ) {
+
+                  const int16_t* first =
+                      weights_[position_first].data();
+
+                  const int16_t* second =
+                      weights_[position_second].data();
+
+                  const int16_t* third =
+                      weights_[position_third].data();
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      uint16_t value =
+                          static_cast<uint16_t>(input[i]);
+
+                      value =
+                          static_cast<uint16_t>(
+                              value -
+                              static_cast<uint16_t>(first[i])
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value -
+                              static_cast<uint16_t>(second[i])
+                          );
+
+                      value =
+                          static_cast<uint16_t>(
+                              value +
+                              static_cast<uint16_t>(third[i])
+                          );
+
+                      input[i] =
+                          static_cast<int16_t>(value);
+                  }
+              }
+
+
+            private:
+
+              alignas(64)
+              std::array<
+                  std::array<int16_t, OUTPUT_SIZE>,
+                  INPUT_SIZE
+              > weights_;
+
+              alignas(64)
+              std::array<int16_t, OUTPUT_SIZE> biases_;
+          };
+
+
+          // ==========================================================
+          // FIRST LINEAR LAYER
+          // ==========================================================
+
+          template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
+          struct LinearLayer {
+
+            public:
+
+              void Initialize(ModelReader& reader) {
+
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
+
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE;
+                          j++
+                      ) {
+
+                          weights_[
+                              GetWeightIndex(
+                                  static_cast<int>(
+                                      j * INPUT_SIZE + i
+                                  )
+                          ] =
+                              reader.ReadWeight<int8_t>(
+                                  WEIGHT_SCALE *
+                                  (1 << LINEAR_ADDITIONAL_PRECISION)
+                              );
+                      }
+                  }
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      biases_[i] =
+                          reader.ReadWeight<int32_t>(
+                              ACTIVATION_SCALE *
+                              WEIGHT_SCALE *
+                              (1 << LINEAR_ADDITIONAL_PRECISION)
+                          );
+                  }
+              }
+
+
+              void Process(
+                  const int8_t* src,
+                  int32_t* dest
+              ) {
+
+                  /*
+                   * The original AVX2 implementation uses
+                   * unsigned activation bytes and signed weights.
+                   *
+                   * ClippedReLU16 guarantees src >= 0.
+                   *
+                   * We therefore reproduce the same scalar
+                   * multiplication here.
+                   */
+
+                  for (
+                      size_t output = 0;
+                      output < OUTPUT_SIZE;
+                      output++
+                  ) {
+
+                      int32_t accumulator =
+                          biases_[output];
+
+                      for (
+                          size_t input = 0;
+                          input < INPUT_SIZE;
+                          input++
+                      ) {
+
+                          int8_t activation =
+                              src[input];
+
+                          if (activation <= 0)
+                              continue;
+
+                          const int8_t weight =
+                              weights_[
+                                  GetWeightIndex(
+                                      static_cast<int>(
+                                          output *
+                                          INPUT_SIZE +
+                                          input
+                                      )
+                                  )
+                              ];
+
+                          accumulator +=
+                              static_cast<int32_t>(
+                                  static_cast<uint8_t>(
+                                      activation
+                                  )
+                              )
+                              *
+                              static_cast<int32_t>(
+                                  weight
+                              );
+                      }
+
+                      dest[output] =
+                          accumulator >>
+                          LINEAR_ADDITIONAL_PRECISION;
+                  }
+              }
+
+
+            private:
+
+              static constexpr int GetWeightIndex(
+                  int idx
+              ) {
+
+                  return
+                      (
+                          (idx / 4)
+                          %
+                          (INPUT_SIZE / 4)
+                          *
+                          OUTPUT_SIZE *
+                          4
+                      )
+                      +
+                      (idx / INPUT_SIZE * 4)
+                      +
+                      (idx % 4);
+              }
+
+
+              alignas(64)
+              std::array<
+                  int8_t,
+                  INPUT_SIZE * OUTPUT_SIZE
+              > weights_;
+
+              alignas(64)
+              std::array<
+                  int32_t,
+                  OUTPUT_SIZE
+              > biases_;
+          };
+
+
+          // ==========================================================
+          // PRECISE LINEAR LAYER
+          // ==========================================================
+
+          template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
+          struct PreciseLinearLayer {
+
+            public:
+
+              void Initialize(ModelReader& reader) {
+
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
+
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE;
+                          j++
+                      ) {
+
+                          weights_[
+                              j * INPUT_SIZE + i
+                          ] =
+                              reader.ReadWeight<int16_t>(
+                                  WEIGHT_SCALE *
+                                  PRECISE_WEIGHT_SCALE
+                              );
+                      }
+                  }
+
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      i++
+                  ) {
+
+                      biases_[i] =
+                          reader.ReadWeight<int32_t>(
+                              ACTIVATION_SCALE *
+                              WEIGHT_SCALE *
+                              WEIGHT_SCALE *
+                              PRECISE_WEIGHT_SCALE
+                          );
+                  }
+              }
+
+
+              void Process(
+                  const int16_t* input,
+                  int32_t* output
+              ) {
+
+                  constexpr int SHIFT = 12;
+
+                  for (
+                      size_t out = 0;
+                      out < OUTPUT_SIZE;
+                      out++
+                  ) {
+
+                      int32_t sum =
+                          biases_[out];
+
+                      const size_t offset =
+                          out * INPUT_SIZE;
+
+                      for (
+                          size_t i = 0;
+                          i < INPUT_SIZE;
+                          i++
+                      ) {
+
+                          sum +=
+                              static_cast<int32_t>(
+                                  input[i]
+                              )
+                              *
+                              static_cast<int32_t>(
+                                  weights_[offset + i]
+                              );
+                      }
+
+                      output[out] =
+                          sum >> SHIFT;
+                  }
+              }
+
+
+            private:
+
+              alignas(64)
+              std::array<
+                  int16_t,
+                  INPUT_SIZE * OUTPUT_SIZE
+              > weights_;
+
+              alignas(64)
+              std::array<
+                  int32_t,
+                  OUTPUT_SIZE
+              > biases_;
+          };
+
+
+          // ==========================================================
+          // OUTPUT LAYER
+          // ==========================================================
+
+          template <size_t INPUT_SIZE>
+          struct OutputLayer {
+
+            public:
+
+              void Initialize(ModelReader& reader) {
+
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
+
+                      weights_[i] =
+                          reader.ReadWeight<int16_t>(
+                              WEIGHT_SCALE *
+                              OUTPUT_SCALE /
+                              ACTIVATION_SCALE
+                          );
+                  }
+
+                  bias_ =
+                      reader.ReadWeight<int32_t>(
+                          WEIGHT_SCALE *
+                          OUTPUT_SCALE
+                      );
+              }
+
+
+              int32_t Process(
+                  const int16_t* input
+              ) {
+
+                  int32_t ans = 0;
+
+                  for (
+                      uint16_t i = 0;
+                      i < INPUT_SIZE;
+                      i++
+                  ) {
+
+                      ans +=
+                          static_cast<int32_t>(
+                              input[i]
+                          )
+                          *
+                          static_cast<int32_t>(
+                              weights_[i]
+                          );
+                  }
+
+                  ans += bias_;
+
+                  return ans;
+              }
+
+
+            private:
+
+              alignas(64)
+              std::array<
+                  int16_t,
+                  INPUT_SIZE
+              > weights_;
+
+              int32_t bias_;
+          };
+
+
+          // ==========================================================
+          // CLIPPED RELU 16 -> INT8
+          // ==========================================================
+
+          inline void ClippedReLU16(
+              int size,
+              int8_t* output,
+              const int16_t* input
+          ) {
+
+              for (
+                  int i = 0;
+                  i < size;
+                  i++
+              ) {
+
+                  int value =
+                      static_cast<int>(
+                          input[i]
+                      )
+                      >>
+                      FEATURE_ADDITIONAL_PRECISION;
+
+                  if (value < -128)
+                      value = -128;
+
+                  if (value > 127)
+                      value = 127;
+
+                  if (value < 0)
+                      value = 0;
+
+                  output[i] =
+                      static_cast<int8_t>(
+                          value
+                      );
+              }
+          }
+
+
+          // ==========================================================
+          // CLIPPED RELU 32 -> INT16
+          // ==========================================================
+
+          inline void ClippedReLU32(
+              int size,
+              int16_t* output,
+              const int32_t* input
+          ) {
+
+              constexpr int upper =
+                  32768 *
+                  WEIGHT_SCALE /
+                  256
+                  -
+                  1;
+
+              for (
+                  int i = 0;
+                  i < size;
+                  i++
+              ) {
+
+                  int32_t value =
+                      input[i];
+
+                  if (value < 0)
+                      value = 0;
+
+                  if (value > upper)
+                      value = upper;
+
+                  output[i] =
+                      static_cast<int16_t>(
+                          value
+                      );
+              }
+          }
+
+          }  // namespace q_eval
+
+          #endif  // QUIRKY_SRC_EVAL_LAYERS_H
+          EOF
+
+          echo "ARM-safe scalar layers.h installed."
+
+
+      # ============================================================
+      # ENABLE NO_AVX2
+      # ============================================================
+      - name: Configure ARM64 Android
         shell: bash
         run: |
           set -eux
@@ -152,6 +937,9 @@ jobs:
 
           export CC="$TOOLCHAIN/aarch64-linux-android24-clang"
           export CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
+
+          echo "CC=$CC"
+          echo "CXX=$CXX"
 
           "$CC" --version
           "$CXX" --version
@@ -162,10 +950,15 @@ jobs:
             -DCMAKE_C_COMPILER="$CC" \
             -DCMAKE_CXX_COMPILER="$CXX" \
             -DCMAKE_C_FLAGS="-O3 -fno-fast-math -fno-omit-frame-pointer" \
-            -DCMAKE_CXX_FLAGS="-O3 -fno-fast-math -fno-omit-frame-pointer -pthread" \
-            -DCMAKE_EXE_LINKER_FLAGS="-pthread"
+            -DCMAKE_CXX_FLAGS="-O3 -fno-fast-math -fno-omit-frame-pointer -pthread -DNO_AVX2=1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-pthread" \
+            -DNO_AVX2=ON
 
-      - name: Verify generated flags
+
+      # ============================================================
+      # VERIFY GENERATED FLAGS
+      # ============================================================
+      - name: Verify generated build flags
         shell: bash
         run: |
           set -e
@@ -174,18 +967,18 @@ jobs:
           echo "GENERATED NINJA FLAGS"
           echo "========================================"
 
-          grep -n "FLAGS =" build/build.ninja | head -30 || true
+          grep -n "FLAGS =" build/build.ninja | head -40 || true
 
           echo
           echo "========================================"
-          echo "BAD FLAG CHECK"
+          echo "X86 FLAG CHECK"
           echo "========================================"
 
           if grep -nE \
             '(^|[[:space:]])-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)([[:space:]]|$)' \
             build/build.ninja ; then
 
-            echo "ERROR: x86 flag reached Ninja."
+            echo "ERROR: x86 flags reached generated Ninja."
             exit 1
           fi
 
@@ -193,16 +986,71 @@ jobs:
             '(^|[[:space:]])(2|3|4\.1|4\.2)([[:space:]]|$)' \
             build/build.ninja ; then
 
-            echo "ERROR: numeric fragments reached Ninja."
+            echo "ERROR: standalone numeric fragments reached Ninja."
             exit 1
           fi
 
           echo "OK: generated flags are clean."
 
+
       # ============================================================
-      # Patch BOTH Quirky pthreads
+      # VERIFY NO X86 INTRINSICS REMAIN IN THE NNUE LAYERS
       # ============================================================
-      - name: Patch Quirky threading
+      - name: Verify ARM-safe NNUE source
+        shell: bash
+        run: |
+          set -e
+
+          echo "========================================"
+          echo "layers.h x86 intrinsic check"
+          echo "========================================"
+
+          if grep -nE \
+            '#include <immintrin.h>|__m256|__m128|_mm256_|_mm_' \
+            src/eval/layers.h ; then
+
+            echo "ERROR: x86 intrinsics remain in layers.h."
+            exit 1
+          fi
+
+          echo "OK: layers.h is ARM-safe."
+
+          echo
+          echo "========================================"
+          echo "remaining intrinsic includes"
+          echo "========================================"
+
+          grep -RInE \
+            '#include <(immintrin|xmmintrin|emmintrin|smmintrin|tmmintrin|wmmintrin|avxintrin|avx2intrin)' \
+            src \
+            --include='*.h' \
+            --include='*.hpp' \
+            --include='*.cpp' \
+            || true
+
+
+      # ============================================================
+      # PATCH SEARCH THREADING
+      #
+      # Original Quirky:
+      #
+      #   SearchLauncher::Start()
+      #       -> std::thread
+      #
+      #   StartMainThread()
+      #       -> std::thread
+      #           -> Searcher::Run()
+      #
+      # Android previously reported:
+      #
+      #   SIGSEGV
+      #   SEGV_ACCERR
+      #   Cause: stack pointer is not in a rw map;
+      #          likely due to stack overflow.
+      #
+      # We give the two pthreads explicit large stacks.
+      # ============================================================
+      - name: Patch Quirky pthread stacks
         shell: bash
         run: |
           set -e
@@ -223,178 +1071,224 @@ jobs:
           hs = h.read_text()
           cs = cpp.read_text()
 
-          # --------------------------------------------------------
+
+          # ========================================================
           # launcher.h
-          # --------------------------------------------------------
+          # ========================================================
 
           hs = hs.replace(
               "#include <thread>",
               "#include <pthread.h>"
           )
 
-          hs = hs.replace(
-              "    std::thread thread_;",
-              "    pthread_t thread_{};\n"
-              "    bool thread_joinable_ = false;"
-          )
+          if "pthread_t thread_{};" not in hs:
+
+              old = "    std::thread thread_;"
+
+              if old not in hs:
+                  raise SystemExit(
+                      "ERROR: std::thread member not found in launcher.h"
+                  )
+
+              hs = hs.replace(
+                  old,
+                  "    pthread_t thread_{};\n"
+                  "    bool thread_joinable_ = false;\n"
+                  "    static void* LauncherThreadEntry(void* raw);",
+                  1
+              )
+
+          elif "LauncherThreadEntry" not in hs:
+
+              marker = "    bool thread_joinable_ = false;"
+
+              hs = hs.replace(
+                  marker,
+                  marker +
+                  "\n"
+                  "    static void* LauncherThreadEntry(void* raw);",
+                  1
+              )
 
           h.write_text(hs)
 
-          # --------------------------------------------------------
+
+          # ========================================================
           # launcher.cpp includes
-          # --------------------------------------------------------
+          # ========================================================
 
           if "#include <pthread.h>" not in cs:
-              lines = cs.splitlines()
 
-              insert_at = 0
-
-              for i, line in enumerate(lines):
-                  if line.startswith("#include "):
-                      insert_at = i + 1
-
-              lines.insert(insert_at, "#include <pthread.h>")
-              lines.insert(insert_at + 1, "#include <memory>")
-
-              cs = "\n".join(lines) + "\n"
-
-          # --------------------------------------------------------
-          # Constants
-          # --------------------------------------------------------
-
-          if "LAUNCHER_STACK_SIZE" not in cs:
-
-              marker = "namespace q_search {"
-
-              helper = [
-                  "",
-                  "namespace {",
-                  "",
-                  "constexpr size_t LAUNCHER_STACK_SIZE = 16 * 1024 * 1024;",
-                  "constexpr size_t SEARCH_STACK_SIZE = 32 * 1024 * 1024;",
-                  "",
-                  "struct LauncherThreadArgs {",
-                  "    SearchLauncher* self;",
-                  "    q_core::Board board;",
-                  "    std::vector<q_core::Move> moves;",
-                  "    time_control_t time_control;",
-                  "    depth_t max_depth;",
-                  "};",
-                  "",
-                  "struct SearchThreadArgs {",
-                  "    Searcher* searcher;",
-                  "    depth_t max_depth;",
-                  "    size_t real_pv_count;",
-                  "};",
-                  "",
-                  "void* SearchThreadEntry(void* raw) {",
-                  "    auto* args = static_cast<SearchThreadArgs*>(raw);",
-                  "",
-                  "    args->searcher->Run(",
-                  "        args->max_depth,",
-                  "        args->real_pv_count",
-                  "    );",
-                  "",
-                  "    delete args;",
-                  "    return nullptr;",
-                  "}",
-                  "",
-                  "void* LauncherThreadEntry(void* raw) {",
-                  "    auto* args = static_cast<LauncherThreadArgs*>(raw);",
-                  "",
-                  "    args->self->StartMainThread(",
-                  "        args->board,",
-                  "        args->moves,",
-                  "        args->time_control,",
-                  "        args->max_depth",
-                  "    );",
-                  "",
-                  "    delete args;",
-                  "    return nullptr;",
-                  "}",
-                  "",
-                  "bool CreateThreadWithStack(",
-                  "    pthread_t* thread,",
-                  "    size_t stack_size,",
-                  "    void* (*entry)(void*),",
-                  "    void* arg",
-                  ") {",
-                  "    pthread_attr_t attr;",
-                  "",
-                  "    if (pthread_attr_init(&attr) != 0)",
-                  "        return false;",
-                  "",
-                  "    if (pthread_attr_setstacksize(&attr, stack_size) != 0) {",
-                  "        pthread_attr_destroy(&attr);",
-                  "        return false;",
-                  "    }",
-                  "",
-                  "    int result = pthread_create(",
-                  "        thread,",
-                  "        &attr,",
-                  "        entry,",
-                  "        arg",
-                  "    );",
-                  "",
-                  "    pthread_attr_destroy(&attr);",
-                  "",
-                  "    return result == 0;",
-                  "}",
-                  "",
-                  "} // namespace",
-                  ""
-              ]
-
-              helper_text = "\n".join(helper)
+              marker = '#include "launcher.h"\n'
 
               if marker not in cs:
                   raise SystemExit(
-                      "ERROR: namespace q_search not found"
+                      "ERROR: launcher.cpp include marker not found"
                   )
 
               cs = cs.replace(
                   marker,
-                  marker + helper_text,
+                  marker +
+                  "\n"
+                  "#include <pthread.h>\n"
+                  "#include <memory>\n",
                   1
               )
 
-          # --------------------------------------------------------
-          # Replace Start() body using brace matching.
-          # --------------------------------------------------------
 
-          start = cs.find("void SearchLauncher::Start(")
+          # ========================================================
+          # Helper structures and pthread function
+          # ========================================================
 
-          if start < 0:
+          if "LAUNCHER_STACK_SIZE" not in cs:
+
+              marker = "namespace q_search {\n"
+
+              if marker not in cs:
+                  raise SystemExit(
+                      "ERROR: q_search namespace not found"
+                  )
+
+              helper = """
+          namespace {
+
+          constexpr size_t LAUNCHER_STACK_SIZE =
+              16 * 1024 * 1024;
+
+          constexpr size_t SEARCH_STACK_SIZE =
+              32 * 1024 * 1024;
+
+
+          struct LauncherThreadArgs {
+              SearchLauncher* self;
+              q_core::Board board;
+              std::vector<q_core::Move> moves;
+              time_control_t time_control;
+              depth_t max_depth;
+          };
+
+
+          struct SearchThreadArgs {
+              Searcher* searcher;
+              depth_t max_depth;
+              size_t real_pv_count;
+          };
+
+
+          void* SearchThreadEntry(void* raw) {
+
+              auto* args =
+                  static_cast<SearchThreadArgs*>(raw);
+
+              args->searcher->Run(
+                  args->max_depth,
+                  args->real_pv_count
+              );
+
+              delete args;
+
+              return nullptr;
+          }
+
+
+          bool CreateThreadWithStack(
+              pthread_t* thread,
+              size_t stack_size,
+              void* (*entry)(void*),
+              void* arg
+          ) {
+
+              pthread_attr_t attr;
+
+              if (pthread_attr_init(&attr) != 0)
+                  return false;
+
+              if (
+                  pthread_attr_setstacksize(
+                      &attr,
+                      stack_size
+                  ) != 0
+              ) {
+
+                  pthread_attr_destroy(&attr);
+                  return false;
+              }
+
+              const int result =
+                  pthread_create(
+                      thread,
+                      &attr,
+                      entry,
+                      arg
+                  );
+
+              pthread_attr_destroy(&attr);
+
+              return result == 0;
+          }
+
+          }  // namespace
+
+          """
+
+              cs = cs.replace(
+                  marker,
+                  marker + helper,
+                  1
+              )
+
+
+          # ========================================================
+          # Replace SearchLauncher::Start()
+          # ========================================================
+
+          start_pos = cs.find(
+              "void SearchLauncher::Start("
+          )
+
+          if start_pos < 0:
               raise SystemExit(
                   "ERROR: SearchLauncher::Start not found"
               )
 
-          brace = cs.find("{", start)
+          start_brace = cs.find(
+              "{",
+              start_pos
+          )
 
-          if brace < 0:
+          if start_brace < 0:
               raise SystemExit(
                   "ERROR: Start() opening brace not found"
               )
 
           depth = 0
-          end = -1
+          end_pos = -1
 
-          for i in range(brace, len(cs)):
+          for i in range(
+              start_brace,
+              len(cs)
+          ):
+
               if cs[i] == "{":
                   depth += 1
+
               elif cs[i] == "}":
                   depth -= 1
+
                   if depth == 0:
-                      end = i + 1
+                      end_pos = i + 1
                       break
 
-          if end < 0:
+          if end_pos < 0:
               raise SystemExit(
                   "ERROR: Start() closing brace not found"
               )
 
-          start_body = [
-              cs[start:brace + 1],
+          signature =
+              cs[start_pos:start_brace + 1]
+
+          new_start = "\n".join([
+              signature,
               "    Join();",
               "    control_.Reset();",
               "    tt_.NextPosition();",
@@ -410,7 +1304,7 @@ jobs:
               "    if (!CreateThreadWithStack(",
               "            &thread_,",
               "            LAUNCHER_STACK_SIZE,",
-              "            LauncherThreadEntry,",
+              "            &SearchLauncher::LauncherThreadEntry,",
               "            args)) {",
               "",
               "        delete args;",
@@ -420,41 +1314,97 @@ jobs:
               "",
               "    thread_joinable_ = true;",
               "}"
-          ]
+          ])
 
-          cs = cs[:start] + "\n".join(start_body) + cs[end:]
-
-          # --------------------------------------------------------
-          # Replace inner Searcher + std::thread block.
-          # --------------------------------------------------------
-
-          pattern = re.compile(
-              r"\s*Searcher\s+searcher\s*\("
-              r".*?"
-              r"std::thread\s+search_thread\s*="
-              r"\s*std::thread\s*\(\[&\]\(\)\s*\{"
-              r".*?"
-              r"\}\s*\);",
-              re.DOTALL
+          cs = (
+              cs[:start_pos]
+              +
+              new_start
+              +
+              cs[end_pos:]
           )
 
-          replacement = "\n".join([
+
+          # ========================================================
+          # Add SearchLauncher::LauncherThreadEntry()
+          # ========================================================
+
+          if "SearchLauncher::LauncherThreadEntry(void*" not in cs:
+
+              marker = (
+                  "uint64_t GetNPS("
+              )
+
+              if marker not in cs:
+                  raise SystemExit(
+                      "ERROR: GetNPS marker not found"
+                  )
+
+              entry = "\n".join([
+                  "void* SearchLauncher::LauncherThreadEntry(void* raw) {",
+                  "",
+                  "    auto* args =",
+                  "        static_cast<LauncherThreadArgs*>(raw);",
+                  "",
+                  "    args->self->StartMainThread(",
+                  "        args->board,",
+                  "        args->moves,",
+                  "        args->time_control,",
+                  "        args->max_depth",
+                  "    );",
+                  "",
+                  "    delete args;",
+                  "",
+                  "    return nullptr;",
+                  "}",
+                  "",
+                  ""
+              ])
+
+              cs = cs.replace(
+                  marker,
+                  entry + marker,
+                  1
+              )
+
+
+          # ========================================================
+          # Replace Searcher + inner std::thread
+          # ========================================================
+
+          old_search_block = (
+              "    SearchStat stat;\n"
+              "    Searcher searcher(tt_, rt, board, control_, stat);\n"
+              "    SearchTimer timer(time_control, board, stat);\n"
+              "    std::thread search_thread = "
+              "std::thread([&]() { "
+              "searcher.Run(max_depth, real_pv_count); });"
+          )
+
+          new_search_block = "\n".join([
+              "    SearchStat stat;",
               "",
-              "    auto searcher = std::make_unique<Searcher>(",
-              "        tt_,",
-              "        rt,",
+              "    auto searcher =",
+              "        std::make_unique<Searcher>(",
+              "            tt_,",
+              "            rt,",
+              "            board,",
+              "            control_,",
+              "            stat",
+              "        );",
+              "",
+              "    SearchTimer timer(",
+              "        time_control,",
               "        board,",
-              "        control_,",
               "        stat",
               "    );",
               "",
-              "    SearchTimer timer(time_control, board, stat);",
-              "",
-              "    auto* search_args = new SearchThreadArgs{",
-              "        searcher.get(),",
-              "        max_depth,",
-              "        real_pv_count",
-              "    };",
+              "    auto* search_args =",
+              "        new SearchThreadArgs{",
+              "            searcher.get(),",
+              "            max_depth,",
+              "            real_pv_count",
+              "        };",
               "",
               "    pthread_t search_thread{};",
               "",
@@ -469,72 +1419,93 @@ jobs:
               "    }"
           ])
 
-          new_cs, count = pattern.subn(
-              replacement,
-              cs,
-              count=1
+          if old_search_block not in cs:
+
+              raise SystemExit(
+                  "ERROR: original Searcher/std::thread "
+                  "block was not found."
+              )
+
+          cs = cs.replace(
+              old_search_block,
+              new_search_block,
+              1
           )
 
-          if count != 1:
-              raise SystemExit(
-                  "ERROR: Searcher/std::thread block not found"
-              )
 
-          cs = new_cs
+          # ========================================================
+          # Replace inner join
+          # ========================================================
 
-          # --------------------------------------------------------
-          # Replace inner join.
-          # --------------------------------------------------------
+          old_join = "    search_thread.join();"
 
-          if "search_thread.join();" in cs:
+          if old_join not in cs:
+
+              if "pthread_join(search_thread" not in cs:
+                  raise SystemExit(
+                      "ERROR: search_thread.join() not found."
+                  )
+
+          else:
+
               cs = cs.replace(
-                  "search_thread.join();",
-                  "pthread_join(search_thread, nullptr);"
-              )
-          elif "pthread_join(search_thread" not in cs:
-              raise SystemExit(
-                  "ERROR: search_thread join not found"
+                  old_join,
+                  "    pthread_join(search_thread, nullptr);",
+                  1
               )
 
-          # --------------------------------------------------------
-          # Replace outer Join() using brace matching.
-          # --------------------------------------------------------
 
-          join_start = cs.find(
+          # ========================================================
+          # Replace SearchLauncher::Join()
+          # ========================================================
+
+          join_pos = cs.find(
               "void SearchLauncher::Join("
           )
 
-          if join_start < 0:
+          if join_pos < 0:
               raise SystemExit(
                   "ERROR: SearchLauncher::Join not found"
               )
 
-          join_brace = cs.find("{", join_start)
+          join_brace = cs.find(
+              "{",
+              join_pos
+          )
 
           if join_brace < 0:
               raise SystemExit(
-                  "ERROR: Join opening brace not found"
+                  "ERROR: Join() opening brace not found"
               )
 
           depth = 0
           join_end = -1
 
-          for i in range(join_brace, len(cs)):
+          for i in range(
+              join_brace,
+              len(cs)
+          ):
+
               if cs[i] == "{":
                   depth += 1
+
               elif cs[i] == "}":
                   depth -= 1
+
                   if depth == 0:
                       join_end = i + 1
                       break
 
           if join_end < 0:
               raise SystemExit(
-                  "ERROR: Join closing brace not found"
+                  "ERROR: Join() closing brace not found"
               )
 
-          join_text = "\n".join([
-              cs[join_start:join_brace + 1],
+          join_signature =
+              cs[join_pos:join_brace + 1]
+
+          new_join = "\n".join([
+              join_signature,
               "    if (thread_joinable_) {",
               "        control_.Stop();",
               "        pthread_join(thread_, nullptr);",
@@ -543,18 +1514,35 @@ jobs:
               "}"
           ])
 
-          cs = cs[:join_start] + join_text + cs[join_end:]
+          cs = (
+              cs[:join_pos]
+              +
+              new_join
+              +
+              cs[join_end:]
+          )
+
+
+          # ========================================================
+          # Final safety check before writing
+          # ========================================================
+
+          if "std::thread" in cs:
+              raise SystemExit(
+                  "ERROR: std::thread still exists in launcher.cpp"
+              )
 
           cpp.write_text(cs)
 
-          print("Thread patch completed successfully.")
+          print("Quirky pthread patch completed.")
 
           PY
 
+
       # ============================================================
-      # Verify threading patch
+      # VERIFY THREAD PATCH
       # ============================================================
-      - name: Verify threading
+      - name: Verify pthread patch
         shell: bash
         run: |
           set -e
@@ -568,11 +1556,20 @@ jobs:
 
           echo
           echo "========================================"
-          echo "PTHREAD"
+          echo "PTHREAD CREATION"
           echo "========================================"
 
           grep -nE \
-            "pthread_create|pthread_join|CreateThreadWithStack|SearchThreadEntry" \
+            "pthread_create|pthread_join|CreateThreadWithStack" \
+            src/search/searcher/launcher.cpp
+
+          echo
+          echo "========================================"
+          echo "SEARCH THREAD"
+          echo "========================================"
+
+          grep -nE \
+            "SearchThreadEntry|search_thread|SEARCH_STACK_SIZE" \
             src/search/searcher/launcher.cpp
 
           echo
@@ -592,23 +1589,29 @@ jobs:
 
           echo "OK: no std::thread remains."
 
+
       # ============================================================
-      # Build
+      # BUILD
       # ============================================================
-      - name: Build
+      - name: Build Quirky
         shell: bash
         run: |
           set -eux
 
           cmake --build build --parallel 2
 
+
       # ============================================================
-      # Find binary
+      # FIND EXECUTABLE
       # ============================================================
-      - name: Find binary
+      - name: Find executable
         shell: bash
         run: |
           set -e
+
+          echo "========================================"
+          echo "EXECUTABLES"
+          echo "========================================"
 
           find build \
             -type f \
@@ -627,15 +1630,31 @@ jobs:
             exit 1
           fi
 
-          echo "BIN=$BIN"
+          echo
+          echo "Selected binary:"
+          echo "$BIN"
+
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-      - name: Verify ARM64
+
+      # ============================================================
+      # VERIFY ARM64
+      # ============================================================
+      - name: Verify AArch64 binary
         shell: bash
         run: |
           set -e
 
+          echo "========================================"
+          echo "FILE"
+          echo "========================================"
+
           file "$BIN"
+
+          echo
+          echo "========================================"
+          echo "ELF HEADER"
+          echo "========================================"
 
           readelf -h "$BIN" | grep -E \
             'Class:|Machine:|Type:'
@@ -645,10 +1664,13 @@ jobs:
             exit 1
           fi
 
+          echo "OK: AArch64 binary."
+
+
       # ============================================================
-      # Package
+      # PACKAGE
       # ============================================================
-      - name: Package
+      - name: Package Quirky
         shell: bash
         run: |
           set -e
@@ -661,9 +1683,18 @@ jobs:
           chmod +x \
             artifact/Quirky-android-arm64
 
-          ls -lh artifact/Quirky-android-arm64
+          echo "========================================"
+          echo "FINAL BINARY"
+          echo "========================================"
 
-      - name: Upload binary
+          ls -lh \
+            artifact/Quirky-android-arm64
+
+
+      # ============================================================
+      # UPLOAD
+      # ============================================================
+      - name: Upload ARM64 binary
         uses: actions/upload-artifact@v4
         with:
           name: Quirky-android-arm64
