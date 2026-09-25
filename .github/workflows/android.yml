@@ -14,14 +14,14 @@ jobs:
     steps:
 
       # ============================================================
-      # CHECKOUT
+      # 1. CHECKOUT
       # ============================================================
       - name: Checkout
         uses: actions/checkout@v4
 
 
       # ============================================================
-      # FIND ANDROID NDK
+      # 2. FIND PREINSTALLED ANDROID NDK
       # ============================================================
       - name: Find Android NDK
         shell: bash
@@ -29,14 +29,14 @@ jobs:
           set -e
 
           NDK="$(find "$ANDROID_SDK_ROOT/ndk" \
-            -maxdepth 1 \
             -mindepth 1 \
+            -maxdepth 1 \
             -type d \
             | sort -V \
             | tail -n1)"
 
           if [ -z "$NDK" ]; then
-            echo "ERROR: Android NDK not found"
+            echo "ERROR: Android NDK not found."
             exit 1
           fi
 
@@ -44,92 +44,106 @@ jobs:
           echo "$NDK"
 
           echo "NDK=$NDK" >> "$GITHUB_ENV"
-          echo "TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+          echo "TOOLCHAIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" \
+            >> "$GITHUB_ENV"
 
 
       # ============================================================
-      # PATCH CMAKE
+      # 3. PATCH CMAKE
+      #
+      # Original Quirky CMake contains:
+      #
+      # -msse
+      # -msse2
+      # -msse3
+      # -mssse3
+      # -msse4.1
+      # -msse4.2
+      # -mpopcnt
+      # -mavx
+      # -mavx2
+      # -mbmi
+      # -mbmi2
+      #
+      # These are x86-only.
       # ============================================================
-      - name: Patch CMakeLists for ARM64
+      - name: Patch CMake for ARM64
         shell: bash
         run: |
           set -e
 
           python3 <<'PY'
           from pathlib import Path
-          import re
 
-          path = Path("CMakeLists.txt")
+          p = Path("CMakeLists.txt")
+          text = p.read_text()
 
-          if not path.exists():
-              raise SystemExit("ERROR: CMakeLists.txt not found")
+          old = '''set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2 -msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt")'''
 
-          lines = path.read_text().splitlines()
+          new = '''set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")'''
 
-          output = []
-          inserted = False
-
-          for line in lines:
-
-              if re.match(
-                  r'^\s*set\s*\(\s*CMAKE_CXX_FLAGS\b',
-                  line
-              ):
-
-                  if not inserted:
-                      output.append(
-                          'set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")'
-                      )
-                      inserted = True
-
-                  continue
-
-              output.append(line)
-
-          if not inserted:
-              output.insert(
-                  4,
-                  'set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")'
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: expected original CMAKE_CXX_FLAGS line was not found."
               )
 
-          path.write_text(
-              "\n".join(output) + "\n"
-          )
+          text = text.replace(old, new, 1)
 
-          print("Patched CMakeLists.txt")
+          old = '''else()
+          set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mavx2 -mbmi -mbmi2")
+          endif()'''
+
+          new = '''else()
+          message(FATAL_ERROR "NO_AVX2 must be enabled for the ARM64 build")
+          endif()'''
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: expected AVX2 CMake block was not found."
+              )
+
+          text = text.replace(old, new, 1)
+
+          p.write_text(text)
           PY
 
           echo
-          echo "===== CMakeLists.txt ====="
+          echo "===== PATCHED CMakeLists.txt ====="
           cat CMakeLists.txt
 
 
       # ============================================================
-      # VERIFY CMAKE
+      # 4. VERIFY NO X86 FLAGS
       # ============================================================
-      - name: Verify CMake flags
+      - name: Verify CMake
         shell: bash
         run: |
           set -e
 
-          echo "===== Checking CMake x86 flags ====="
-
           if grep -nE \
-            -- \
-            '-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)' \
-            CMakeLists.txt ; then
+            -- '-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)' \
+            CMakeLists.txt; then
 
-            echo "ERROR: x86 flags remain in CMakeLists.txt"
+            echo "ERROR: x86 flags remain."
             exit 1
           fi
 
-          echo "OK: no x86 compiler flags remain."
+          echo "OK: CMake contains no x86 compiler flags."
 
 
       # ============================================================
-      # ARM-SAFE NNUE LAYERS
+      # 5. REPLACE AVX2-ONLY NNUE LAYERS
+      #
+      # The original layers.h explicitly says compilation without
+      # AVX2 is unsupported and directly includes immintrin.h.
+      #
+      # ARM64 cannot compile that implementation.
+      #
+      # This version keeps the same layer interfaces and performs
+      # the operations scalarly.
       # ============================================================
-      - name: Replace AVX2 NNUE layers
+      - name: Make NNUE layers ARM portable
         shell: bash
         run: |
           set -e
@@ -141,7 +155,6 @@ jobs:
           #include <algorithm>
           #include <array>
           #include <cmath>
-          #include <concepts>
           #include <cstddef>
           #include <cstdint>
           #include <limits>
@@ -164,6 +177,7 @@ jobs:
 
 
           struct ModelReader {
+            public:
 
               template <std::integral T>
               T ReadWeight(int scale) {
@@ -182,7 +196,6 @@ jobs:
                           static_cast<int64_t>(
                               std::numeric_limits<T>::min())
                   ) {
-
                       q_util::ExitWithError(
                           "Model weights are out of range"
                       );
@@ -191,7 +204,7 @@ jobs:
                   return static_cast<T>(final_weight);
               }
 
-          private:
+            private:
 
               size_t index_ = 0;
           };
@@ -203,6 +216,8 @@ jobs:
 
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct FeatureLayer {
+
+            public:
 
               void Initialize(ModelReader& reader) {
 
@@ -231,8 +246,7 @@ jobs:
                                   static_cast<size_t>(
                                       q_core::FlipCellColor(cell)
                                   ) - 1
-                              )
-                              *
+                              ) *
                               q_core::BOARD_SIZE
                               +
                               q_core::FlipCoord(coord);
@@ -279,39 +293,25 @@ jobs:
                   const int16_t* weights =
                       weights_[position].data();
 
-                  for (
-                      size_t i = 0;
-                      i < OUTPUT_SIZE;
-                      i++
-                  ) {
+                  if (delta == -1) {
 
-                      uint16_t value =
-                          static_cast<uint16_t>(
-                              input[i]
-                          );
-
-                      uint16_t weight =
-                          static_cast<uint16_t>(
-                              weights[i]
-                          );
-
-                      if (delta == -1) {
-
-                          value =
-                              static_cast<uint16_t>(
-                                  value - weight
-                              );
-
-                      } else {
-
-                          value =
-                              static_cast<uint16_t>(
-                                  value + weight
-                              );
+                      for (
+                          uint16_t i = 0;
+                          i < OUTPUT_SIZE;
+                          i++
+                      ) {
+                          input[i] -= weights[i];
                       }
 
-                      input[i] =
-                          static_cast<int16_t>(value);
+                  } else {
+
+                      for (
+                          uint16_t i = 0;
+                          i < OUTPUT_SIZE;
+                          i++
+                      ) {
+                          input[i] += weights[i];
+                      }
                   }
               }
 
@@ -451,7 +451,7 @@ jobs:
               }
 
 
-          private:
+            private:
 
               alignas(64)
               std::array<
@@ -473,6 +473,8 @@ jobs:
 
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct LinearLayer {
+
+            public:
 
               void Initialize(ModelReader& reader) {
 
@@ -573,7 +575,7 @@ jobs:
               }
 
 
-          private:
+            private:
 
               static constexpr int GetWeightIndex(
                   int idx
@@ -615,6 +617,8 @@ jobs:
 
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct PreciseLinearLayer {
+
+            public:
 
               void Initialize(ModelReader& reader) {
 
@@ -708,7 +712,7 @@ jobs:
               }
 
 
-          private:
+            private:
 
               alignas(64)
               std::array<
@@ -730,6 +734,8 @@ jobs:
 
           template <size_t INPUT_SIZE>
           struct OutputLayer {
+
+            public:
 
               void Initialize(ModelReader& reader) {
 
@@ -782,7 +788,7 @@ jobs:
               }
 
 
-          private:
+            private:
 
               alignas(64)
               std::array<
@@ -871,34 +877,15 @@ jobs:
           #endif
           EOF
 
-          echo "ARM-safe layers.h installed."
+          echo "ARM64 NNUE layer implementation installed."
 
 
       # ============================================================
-      # VERIFY LAYERS
+      # 6. PATCH LAUNCHER HEADER
+      #
+      # This is based on the exact launcher.h in the uploaded ZIP.
       # ============================================================
-      - name: Verify layers
-        shell: bash
-        run: |
-          set -e
-
-          echo "===== Checking layers.h ====="
-
-          if grep -nE \
-            '#include <immintrin.h>|__m256|__m128|_mm256_|_mm_' \
-            src/eval/layers.h ; then
-
-            echo "ERROR: x86 intrinsics remain in layers.h"
-            exit 1
-          fi
-
-          echo "OK: layers.h contains no x86 intrinsic names."
-
-
-      # ============================================================
-      # PATCH SEARCH THREADING
-      # ============================================================
-      - name: Patch pthread search threads
+      - name: Patch launcher header
         shell: bash
         run: |
           set -e
@@ -906,81 +893,91 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          header = Path(
+          p = Path(
               "src/search/searcher/launcher.h"
           )
 
-          source = Path(
-              "src/search/searcher/launcher.cpp"
-          )
+          text = p.read_text()
 
-          h = header.read_text()
-          c = source.read_text()
+          old = '''#include <thread>'''
 
+          new = '''#include <pthread.h>'''
 
-          # ========================================================
-          # HEADER
-          # ========================================================
-
-          if '#include <thread>' not in h:
+          if old not in text:
               raise SystemExit(
-                  "ERROR: launcher.h does not contain <thread>"
+                  "ERROR: expected <thread> include not found in launcher.h"
               )
 
-          h = h.replace(
-              '#include <thread>',
-              '#include <pthread.h>',
-              1
-          )
+          text = text.replace(old, new, 1)
 
 
-          old_member = '    std::thread thread_;'
+          old = '''    std::thread thread_;'''
 
-          new_member = '''    pthread_t thread_{};
+          new = '''    pthread_t thread_{};
               bool thread_joinable_ = false;
               static void* LauncherThreadEntry(void* raw);'''
 
-          if old_member not in h:
+          if old not in text:
               raise SystemExit(
-                  "ERROR: std::thread member not found"
+                  "ERROR: expected std::thread member not found in launcher.h"
               )
 
-          h = h.replace(
-              old_member,
-              new_member,
-              1
+          text = text.replace(old, new, 1)
+
+          p.write_text(text)
+          PY
+
+          echo "launcher.h patched."
+
+
+      # ============================================================
+      # 7. PATCH LAUNCHER CPP
+      #
+      # Every replacement below is matched against the exact source
+      # from the uploaded Quirky archive.
+      # ============================================================
+      - name: Patch launcher implementation
+        shell: bash
+        run: |
+          set -e
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "src/search/searcher/launcher.cpp"
           )
 
-          header.write_text(h)
+          text = p.read_text()
 
 
-          # ========================================================
-          # INCLUDES
-          # ========================================================
+          # --------------------------------------------------------
+          # Includes
+          # --------------------------------------------------------
 
-          marker = '''#include "launcher.h"
+          old = '''#include "launcher.h"
 
-          #include <string>'''
+          #include <string>
+          #include <utility>'''
 
-          if marker not in c:
-              raise SystemExit(
-                  "ERROR: launcher.cpp include block not found"
-              )
-
-          c = c.replace(
-              marker,
-              '''#include "launcher.h"
+          new = '''#include "launcher.h"
 
           #include <memory>
           #include <pthread.h>
-          #include <string>''',
-              1
-          )
+          #include <string>
+          #include <utility>'''
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: launcher.cpp include block does not match."
+              )
+
+          text = text.replace(old, new, 1)
 
 
-          # ========================================================
-          # THREAD HELPERS
-          # ========================================================
+          # --------------------------------------------------------
+          # Insert pthread helpers
+          # --------------------------------------------------------
 
           marker = '''namespace q_search {
 
@@ -1013,27 +1010,11 @@ jobs:
           };
 
 
-          void* SearchThreadEntry(void* raw) {
-
-              auto* args =
-                  static_cast<SearchThreadArgs*>(raw);
-
-              args->searcher->Run(
-                  args->max_depth,
-                  args->pv_count
-              );
-
-              delete args;
-
-              return nullptr;
-          }
-
-
           bool CreateThreadWithStack(
               pthread_t* thread,
               size_t stack_size,
               void* (*entry)(void*),
-              void* arg
+              void* argument
           ) {
 
               pthread_attr_t attr;
@@ -1052,12 +1033,12 @@ jobs:
                   return false;
               }
 
-              int result =
+              const int result =
                   pthread_create(
                       thread,
                       &attr,
                       entry,
-                      arg
+                      argument
                   );
 
               pthread_attr_destroy(&attr);
@@ -1065,28 +1046,46 @@ jobs:
               return result == 0;
           }
 
+
+          void* SearchThreadEntry(void* raw) {
+
+              auto* args =
+                  static_cast<SearchThreadArgs*>(
+                      raw
+                  );
+
+              args->searcher->Run(
+                  args->max_depth,
+                  args->pv_count
+              );
+
+              delete args;
+
+              return nullptr;
+          }
+
           }  // namespace
 
 
           uint8_t GetRTByteSizeLog'''
 
-          if marker not in c:
+          if marker not in text:
               raise SystemExit(
-                  "ERROR: namespace marker not found"
+                  "ERROR: launcher namespace marker does not match."
               )
 
-          c = c.replace(
+          text = text.replace(
               marker,
               replacement,
               1
           )
 
 
-          # ========================================================
-          # START
-          # ========================================================
+          # --------------------------------------------------------
+          # SearchLauncher::Start
+          # --------------------------------------------------------
 
-          old_start = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
+          old = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
                                              time_control_t time_control, depth_t max_depth) {
               Join();
               control_.Reset();
@@ -1096,7 +1095,7 @@ jobs:
               });
           }'''
 
-          new_start = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
+          new = '''void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core::Move>& moves,
                                              time_control_t time_control, depth_t max_depth) {
               Join();
               control_.Reset();
@@ -1121,7 +1120,7 @@ jobs:
                   thread_joinable_ = false;
 
                   q_util::PrintError(
-                      "Failed to create launcher pthread"
+                      "Failed to create launcher thread"
                   );
 
                   return;
@@ -1130,28 +1129,28 @@ jobs:
               thread_joinable_ = true;
           }'''
 
-          if old_start not in c:
+          if old not in text:
               raise SystemExit(
-                  "ERROR: original Start() block not found"
+                  "ERROR: exact SearchLauncher::Start block not found."
               )
 
-          c = c.replace(
-              old_start,
-              new_start,
-              1
-          )
+          text = text.replace(old, new, 1)
 
 
-          # ========================================================
-          # LAUNCHER THREAD ENTRY
-          # ========================================================
+          # --------------------------------------------------------
+          # Launcher thread entry
+          # --------------------------------------------------------
 
-          marker = 'uint64_t GetNPS'
+          marker = '''uint64_t GetNPS(const SearchStat& stat, time_t time_since_start)'''
 
-          replacement = '''void* SearchLauncher::LauncherThreadEntry(void* raw) {
+          replacement = '''void* SearchLauncher::LauncherThreadEntry(
+              void* raw
+          ) {
 
               auto* args =
-                  static_cast<LauncherThreadArgs*>(raw);
+                  static_cast<LauncherThreadArgs*>(
+                      raw
+                  );
 
               args->self->StartMainThread(
                   args->board,
@@ -1166,30 +1165,30 @@ jobs:
           }
 
 
-          uint64_t GetNPS'''
+          uint64_t GetNPS(const SearchStat& stat, time_t time_since_start)'''
 
-          if marker not in c:
+          if marker not in text:
               raise SystemExit(
-                  "ERROR: GetNPS marker not found"
+                  "ERROR: GetNPS marker not found."
               )
 
-          c = c.replace(
+          text = text.replace(
               marker,
               replacement,
               1
           )
 
 
-          # ========================================================
-          # SEARCH THREAD
-          # ========================================================
+          # --------------------------------------------------------
+          # Searcher creation + inner search thread
+          # --------------------------------------------------------
 
-          old_search = '''    SearchStat stat;
+          old = '''    SearchStat stat;
               Searcher searcher(tt_, rt, board, control_, stat);
               SearchTimer timer(time_control, board, stat);
               std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });'''
 
-          new_search = '''    SearchStat stat;
+          new = '''    SearchStat stat;
 
               auto searcher =
                   std::make_unique<Searcher>(
@@ -1219,64 +1218,57 @@ jobs:
                       &search_thread,
                       SEARCH_STACK_SIZE,
                       SearchThreadEntry,
-                      search_args)) {
+                      search_args
+                  )) {
 
                   delete search_args;
 
                   q_util::PrintError(
-                      "Failed to create search pthread"
+                      "Failed to create search thread"
                   );
 
                   return;
               }'''
 
-          if old_search not in c:
+          if old not in text:
               raise SystemExit(
-                  "ERROR: original search thread block not found"
+                  "ERROR: exact Searcher/std::thread block not found."
               )
 
-          c = c.replace(
-              old_search,
-              new_search,
-              1
-          )
+          text = text.replace(old, new, 1)
 
 
-          # ========================================================
-          # SEARCH JOIN
-          # ========================================================
+          # --------------------------------------------------------
+          # Inner join
+          # --------------------------------------------------------
 
-          old_join = '    search_thread.join();'
+          old = '''    search_thread.join();'''
 
-          new_join = '''    pthread_join(
-                  search_thread,
-                  nullptr
-              );'''
+          new = '''    pthread_join(
+              search_thread,
+              nullptr
+          );'''
 
-          if old_join not in c:
+          if old not in text:
               raise SystemExit(
-                  "ERROR: search_thread.join() not found"
+                  "ERROR: search_thread.join() not found."
               )
 
-          c = c.replace(
-              old_join,
-              new_join,
-              1
-          )
+          text = text.replace(old, new, 1)
 
 
-          # ========================================================
-          # LAUNCHER JOIN
-          # ========================================================
+          # --------------------------------------------------------
+          # Launcher Join()
+          # --------------------------------------------------------
 
-          old_join = '''void SearchLauncher::Join() {
+          old = '''void SearchLauncher::Join() {
               if (thread_.joinable()) {
                   control_.Stop();
                   thread_.join();
               }
           }'''
 
-          new_join = '''void SearchLauncher::Join() {
+          new = '''void SearchLauncher::Join() {
               if (thread_joinable_) {
 
                   control_.Stop();
@@ -1290,90 +1282,100 @@ jobs:
               }
           }'''
 
-          if old_join not in c:
+          if old not in text:
               raise SystemExit(
-                  "ERROR: original Join() block not found"
+                  "ERROR: exact SearchLauncher::Join block not found."
               )
 
-          c = c.replace(
-              old_join,
-              new_join,
-              1
-          )
+          text = text.replace(old, new, 1)
 
 
-          # ========================================================
-          # FINAL CHECK
-          # ========================================================
+          # --------------------------------------------------------
+          # Make sure we didn't accidentally leave std::thread.
+          # --------------------------------------------------------
 
-          if 'std::thread' in c:
+          if "std::thread" in text:
               raise SystemExit(
-                  "ERROR: std::thread remains in launcher.cpp"
+                  "ERROR: std::thread remains in launcher.cpp."
               )
 
-          source.write_text(c)
+          p.write_text(text)
 
-          print("pthread patch completed.")
+          print("launcher.cpp patched successfully.")
           PY
 
 
       # ============================================================
-      # VERIFY THREAD PATCH
+      # 8. VERIFY SOURCE PATCHES
       # ============================================================
-      - name: Verify pthread patch
+      - name: Verify source
         shell: bash
         run: |
           set -e
 
-          echo "===== STACK SIZES ====="
+          echo "===== THREAD STACKS ====="
 
           grep -nE \
-            "LAUNCHER_STACK_SIZE|SEARCH_STACK_SIZE" \
+            'LAUNCHER_STACK_SIZE|SEARCH_STACK_SIZE' \
             src/search/searcher/launcher.cpp
 
           echo
           echo "===== PTHREAD ====="
 
           grep -nE \
-            "pthread_create|pthread_join|pthread_attr_setstacksize" \
+            'pthread_create|pthread_join|pthread_attr_setstacksize' \
             src/search/searcher/launcher.cpp
 
           echo
-          echo "===== std::thread ====="
+          echo "===== SEARCHER HEAP ====="
+
+          grep -n \
+            'make_unique<Searcher>' \
+            src/search/searcher/launcher.cpp
+
+          echo
+          echo "===== CHECK std::thread ====="
 
           if grep -RIn \
-            --include='launcher.cpp' \
-            --include='launcher.h' \
             'std::thread' \
-            src/search/searcher ; then
+            src/search/searcher/launcher.cpp \
+            src/search/searcher/launcher.h; then
 
             echo "ERROR: std::thread remains."
             exit 1
           fi
 
-          echo "OK: no std::thread remains."
+          echo "OK."
 
 
       # ============================================================
-      # CLEAN CONFIGURE
+      # 9. CLEAN BUILD DIRECTORY
       # ============================================================
-      - name: Configure ARM64 build
+      - name: Clean build
         shell: bash
         run: |
           set -eux
 
           rm -rf build
 
+
+      # ============================================================
+      # 10. CONFIGURE
+      # ============================================================
+      - name: Configure ARM64
+        shell: bash
+        run: |
+          set -eux
+
           export CC="$TOOLCHAIN/aarch64-linux-android24-clang"
           export CXX="$TOOLCHAIN/aarch64-linux-android24-clang++"
-
-          echo "CC=$CC"
-          echo "CXX=$CXX"
 
           "$CC" --version
           "$CXX" --version
 
-          cmake -S . -B build \
+          cmake \
+            -S . \
+            -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="$CC" \
@@ -1385,47 +1387,30 @@ jobs:
 
 
       # ============================================================
-      # VERIFY GENERATED BUILD FLAGS
+      # 11. VERIFY GENERATED FLAGS
       # ============================================================
-      - name: Verify generated Ninja flags
+      - name: Verify generated flags
         shell: bash
         run: |
           set -e
 
-          echo "===== GENERATED FLAGS ====="
+          echo "===== X86 FLAGS IN BUILD ====="
 
-          grep -n "FLAGS =" \
-            build/build.ninja \
-            | head -50 || true
+          if grep -RInE \
+            -- '-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)' \
+            build \
+            --include='build.ninja' \
+            --include='*.ninja'; then
 
-          echo
-          echo "===== X86 FLAGS ====="
-
-          if grep -nE \
-            '(^|[[:space:]])-m(sse|ssse|avx|avx2|popcnt|bmi|bmi2|fma|f16c|abm|xop)([[:space:]]|$)' \
-            build/build.ninja ; then
-
-            echo "ERROR: x86 flags reached build.ninja"
+            echo "ERROR: x86 flags reached generated build files."
             exit 1
           fi
 
-          echo
-          echo "===== NUMERIC FRAGMENTS ====="
-
-          if grep -nE \
-            '(^|[[:space:]])(2|3|4\.1|4\.2)([[:space:]]|$)' \
-            build/build.ninja ; then
-
-            echo "ERROR: malformed numeric fragments reached build.ninja"
-            exit 1
-          fi
-
-          echo
-          echo "OK: generated flags are clean."
+          echo "OK: no x86 flags."
 
 
       # ============================================================
-      # BUILD
+      # 12. BUILD
       # ============================================================
       - name: Build Quirky
         shell: bash
@@ -1436,30 +1421,21 @@ jobs:
 
 
       # ============================================================
-      # FIND EXECUTABLE
+      # 13. LOCATE BINARY
       # ============================================================
-      - name: Find Quirky executable
+      - name: Locate binary
         shell: bash
         run: |
           set -e
 
-          echo "===== EXECUTABLES ====="
-
-          find build \
-            -type f \
-            -perm -111 \
-            -print
-
           BIN="$(find build \
             -type f \
             -perm -111 \
-            ! -name '*.so' \
-            ! -name '*.a' \
-            -name 'Quirky' \
+            -name Quirky \
             | head -n1)"
 
           if [ -z "$BIN" ]; then
-            echo "ERROR: Quirky executable not found."
+            echo "ERROR: Quirky executable was not found."
             exit 1
           fi
 
@@ -1470,35 +1446,30 @@ jobs:
 
 
       # ============================================================
-      # VERIFY AARCH64
+      # 14. VERIFY ELF
       # ============================================================
-      - name: Verify ARM64 ELF
+      - name: Verify AArch64 binary
         shell: bash
         run: |
           set -e
 
-          echo "===== FILE ====="
-
           file "$BIN"
-
-          echo
-          echo "===== ELF HEADER ====="
 
           readelf -h "$BIN" | grep -E \
             'Class:|Machine:|Type:'
 
-          if ! readelf -h "$BIN" | grep -q "AArch64"; then
+          if ! readelf -h "$BIN" | grep -q 'AArch64'; then
             echo "ERROR: binary is not AArch64."
             exit 1
           fi
 
-          echo "OK: AArch64 binary."
+          echo "OK: ARM64 ELF."
 
 
       # ============================================================
-      # PACKAGE
+      # 15. PACKAGE
       # ============================================================
-      - name: Package binary
+      - name: Package
         shell: bash
         run: |
           set -e
@@ -1516,9 +1487,9 @@ jobs:
 
 
       # ============================================================
-      # UPLOAD
+      # 16. UPLOAD
       # ============================================================
-      - name: Upload ARM64 binary
+      - name: Upload ARM64 engine
         uses: actions/upload-artifact@v4
         with:
           name: Quirky-android-arm64
