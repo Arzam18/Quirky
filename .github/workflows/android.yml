@@ -16,15 +16,19 @@ jobs:
 
     steps:
 
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
-      # ------------------------------------------------------------
-      # Android NDK
-      # ------------------------------------------------------------
+      # ============================================================
+      # ANDROID NDK
+      # ============================================================
 
       - name: Locate Android NDK
         shell: bash
@@ -37,7 +41,8 @@ jobs:
 
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
 
-          echo "SDK: $SDK"
+          echo "SDK:"
+          echo "$SDK"
 
           if [ ! -d "$SDK" ]; then
             echo "ERROR: Android SDK not found."
@@ -45,7 +50,7 @@ jobs:
           fi
 
           echo
-          echo "Installed NDKs:"
+          echo "Installed NDK versions:"
           find "$SDK/ndk" \
             -mindepth 1 \
             -maxdepth 1 \
@@ -75,6 +80,10 @@ jobs:
 
           echo "ANDROID_SDK=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
+
+      # ============================================================
+      # ARM64 COMPILER
+      # ============================================================
 
       - name: Locate ARM64 Compiler
         shell: bash
@@ -117,9 +126,9 @@ jobs:
           echo "Target:"
           "$NDK_CXX" -dumpmachine
 
-      # ------------------------------------------------------------
+      # ============================================================
       # REMOVE X86 / SSE FLAGS
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Remove x86 CPU Flags
         shell: bash
@@ -127,25 +136,21 @@ jobs:
           set -e
 
           echo "========================================"
-          echo "REMOVING X86/SSE FLAGS"
+          echo "SEARCHING FOR X86 FLAGS"
           echo "========================================"
-
-          echo
-          echo "Searching repository..."
 
           grep -RInE \
             --exclude-dir=.git \
             --exclude-dir=build \
             --exclude='*.md' \
-            --exclude='*.txt' \
             --exclude='*.json' \
             --exclude='*.lock' \
             -- \
-            '-msse|-msse2|-msse3|-mssse3|-msse4\.1|-msse4\.2|-mpopcnt|-mavx|-mavx2|-mfma' \
+            '-msse|-msse2|-msse3|-mssse3|-msse4\.1|-msse4\.2|-mpopcnt|-mavx|-mavx2|-mfma|-mbmi|-mbmi2|-mlzcnt|-mf16c|-mxsave|-mxsaveopt' \
             . || true
 
           echo
-          echo "Removing flags from CMake/source configuration..."
+          echo "Removing incompatible flags..."
 
           python3 <<'PY'
           from pathlib import Path
@@ -182,7 +187,7 @@ jobs:
               ".hpp",
           }
 
-          replacements = 0
+          changed = 0
 
           for path in Path(".").rglob("*"):
 
@@ -222,10 +227,10 @@ jobs:
                   )
 
                   print("Modified:", path)
-                  replacements += 1
+                  changed += 1
 
           print()
-          print("Files modified:", replacements)
+          print("Files modified:", changed)
           PY
 
           echo
@@ -235,25 +240,168 @@ jobs:
             --exclude-dir=build \
             --exclude='*.md' \
             -- \
-            '-msse|-msse2|-msse3|-mssse3|-msse4\.1|-msse4\.2|-mpopcnt|-mavx|-mavx2|-mfma' \
+            '-msse|-msse2|-msse3|-mssse3|-msse4\.1|-msse4\.2|-mpopcnt|-mavx|-mavx2|-mfma|-mbmi|-mbmi2|-mlzcnt|-mf16c|-mxsave|-mxsaveopt' \
             . || true
 
-      # ------------------------------------------------------------
-      # PORTABLE NNUE
-      # ------------------------------------------------------------
+      # ============================================================
+      # SEARCHER STACK -> HEAP
+      # ============================================================
+
+      - name: Move Searcher To Heap For Android
+        shell: bash
+        run: |
+          set -e
+
+          echo "========================================"
+          echo "ANDROID SEARCHER STACK FIX"
+          echo "========================================"
+
+          FILE="src/search/searcher/launcher.cpp"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: Cannot find:"
+            echo "$FILE"
+
+            echo
+            echo "Searching for launcher.cpp:"
+            find src \
+              -type f \
+              -name 'launcher.cpp' \
+              -print
+
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$FILE"
+
+          cp "$FILE" "$FILE.original"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("src/search/searcher/launcher.cpp")
+          text = path.read_text()
+
+          # --------------------------------------------------------
+          # Include <memory>
+          # --------------------------------------------------------
+
+          if "#include <memory>" not in text:
+
+              includes = [
+                  "#include <string>",
+                  "#include <thread>",
+                  "#include <utility>",
+              ]
+
+              inserted = False
+
+              for inc in includes:
+
+                  if inc in text:
+                      text = text.replace(
+                          inc,
+                          "#include <memory>\n" + inc,
+                          1
+                      )
+                      inserted = True
+                      break
+
+              if not inserted:
+                  text = "#include <memory>\n" + text
+
+          # --------------------------------------------------------
+          # Find local Searcher construction
+          # --------------------------------------------------------
+
+          pattern = re.compile(
+              r'(?P<indent>\s*)Searcher\s+searcher'
+              r'\((?P<args>[^;]+)\);'
+          )
+
+          match = pattern.search(text)
+
+          if not match:
+              print(
+                  "ERROR: Could not find local Searcher construction."
+              )
+
+              for line in text.splitlines():
+                  if "Searcher" in line or "search_thread" in line:
+                      print(line)
+
+              raise SystemExit(1)
+
+          indent = match.group("indent")
+          args = match.group("args")
+
+          replacement = (
+              f"{indent}auto searcher = "
+              f"std::make_unique<Searcher>({args});"
+          )
+
+          text = (
+              text[:match.start()]
+              + replacement
+              + text[match.end():]
+          )
+
+          # --------------------------------------------------------
+          # Change searcher.Run -> searcher->Run
+          # --------------------------------------------------------
+
+          text, count = re.subn(
+              r'\bsearcher\.Run\(',
+              'searcher->Run(',
+              text
+          )
+
+          if count == 0:
+              print(
+                  "ERROR: Could not find searcher.Run() call."
+              )
+
+              raise SystemExit(1)
+
+          path.write_text(text)
+
+          print()
+          print("SUCCESS")
+          print("Searcher is now heap allocated.")
+          print("Run calls changed:", count)
+          PY
+
+          echo
+          echo "Patched Searcher lines:"
+          grep -n -A12 -B5 \
+            -E "make_unique<Searcher>|searcher->Run" \
+            "$FILE"
+
+      # ============================================================
+      # BACKUP NNUE
+      # ============================================================
 
       - name: Back Up Original NNUE Layers
         shell: bash
         run: |
           set -e
 
-          test -f src/eval/layers.h
+          if [ ! -f src/eval/layers.h ]; then
+            echo "ERROR: src/eval/layers.h not found."
+            exit 1
+          fi
 
           cp \
             src/eval/layers.h \
             src/eval/layers.h.original
 
           echo "Original layers.h backed up."
+
+      # ============================================================
+      # PORTABLE ARM NNUE
+      # ============================================================
 
       - name: Install Portable ARM NNUE Layers
         shell: bash
@@ -292,7 +440,8 @@ jobs:
               template <std::integral T>
               T ReadWeight(int scale) {
 
-                  float weight = MODEL_WEIGHTS[index_++];
+                  float weight =
+                      MODEL_WEIGHTS[index_++];
 
                   int64_t final_weight =
                       std::round(weight * scale);
@@ -314,24 +463,31 @@ jobs:
               }
 
           private:
+
               size_t index_ = 0;
           };
 
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct FeatureLayer {
 
-              void Initialize(ModelReader& reader) {
+              void Initialize(
+                  ModelReader& reader) {
 
-                  for (size_t i = 0; i < INPUT_SIZE; ++i) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      ++i) {
 
-                      for (size_t j = 0;
-                           j < OUTPUT_SIZE / 2;
-                           ++j) {
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE / 2;
+                          ++j) {
 
                           weights_[i][j] =
                               reader.ReadWeight<int16_t>(
                                   ACTIVATION_SCALE *
-                                  (1 << FEATURE_ADDITIONAL_PRECISION));
+                                  (1 <<
+                                   FEATURE_ADDITIONAL_PRECISION));
 
                           const q_core::cell_t cell =
                               i / q_core::BOARD_SIZE + 1;
@@ -342,32 +498,39 @@ jobs:
                           const size_t pos =
                               (
                                   static_cast<size_t>(
-                                      q_core::FlipCellColor(cell))
+                                      q_core::FlipCellColor(
+                                          cell))
                                   - 1
                               ) *
-                              q_core::BOARD_SIZE +
+                              q_core::BOARD_SIZE
+                              +
                               q_core::FlipCoord(coord);
 
-                          weights_[pos][j + OUTPUT_SIZE / 2] =
+                          weights_[pos]
+                                  [j + OUTPUT_SIZE / 2] =
                               weights_[i][j];
                       }
                   }
 
-                  for (size_t i = 0;
-                       i < OUTPUT_SIZE / 2;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE / 2;
+                      ++i) {
 
                       biases_[i] =
                           reader.ReadWeight<int16_t>(
                               ACTIVATION_SCALE *
-                              (1 << FEATURE_ADDITIONAL_PRECISION));
+                              (1 <<
+                               FEATURE_ADDITIONAL_PRECISION));
 
-                      biases_[i + OUTPUT_SIZE / 2] =
+                      biases_[i +
+                              OUTPUT_SIZE / 2] =
                           biases_[i];
                   }
               }
 
-              void GetResultOnEmptyBoard(int16_t* output) {
+              void GetResultOnEmptyBoard(
+                  int16_t* output) {
 
                   std::copy(
                       biases_.begin(),
@@ -385,18 +548,20 @@ jobs:
 
                   if (delta == -1) {
 
-                      for (size_t i = 0;
-                           i < OUTPUT_SIZE;
-                           ++i) {
+                      for (
+                          size_t i = 0;
+                          i < OUTPUT_SIZE;
+                          ++i) {
 
                           input[i] -= weights[i];
                       }
 
                   } else {
 
-                      for (size_t i = 0;
-                           i < OUTPUT_SIZE;
-                           ++i) {
+                      for (
+                          size_t i = 0;
+                          i < OUTPUT_SIZE;
+                          ++i) {
 
                           input[i] += weights[i];
                       }
@@ -410,9 +575,10 @@ jobs:
                   const int16_t* weights =
                       weights_[position].data();
 
-                  for (size_t i = 0;
-                       i < OUTPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      ++i) {
 
                       input[i] += weights[i];
                   }
@@ -429,9 +595,10 @@ jobs:
                   const int16_t* second =
                       weights_[position_second].data();
 
-                  for (size_t i = 0;
-                       i < OUTPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      ++i) {
 
                       input[i] -= first[i];
                       input[i] += second[i];
@@ -453,9 +620,10 @@ jobs:
                   const int16_t* third =
                       weights_[position_third].data();
 
-                  for (size_t i = 0;
-                       i < OUTPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      ++i) {
 
                       input[i] -= first[i];
                       input[i] -= second[i];
@@ -472,21 +640,27 @@ jobs:
               > weights_;
 
               alignas(64)
-              std::array<int16_t, OUTPUT_SIZE> biases_;
+              std::array<
+                  int16_t,
+                  OUTPUT_SIZE
+              > biases_;
           };
 
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct LinearLayer {
 
-              void Initialize(ModelReader& reader) {
+              void Initialize(
+                  ModelReader& reader) {
 
-                  for (size_t i = 0;
-                       i < INPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      ++i) {
 
-                      for (size_t j = 0;
-                           j < OUTPUT_SIZE;
-                           ++j) {
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE;
+                          ++j) {
 
                           weights_[
                               GetWeightIndex(
@@ -495,25 +669,36 @@ jobs:
                           ] =
                               reader.ReadWeight<int8_t>(
                                   WEIGHT_SCALE *
-                                  (1 << LINEAR_ADDITIONAL_PRECISION));
+                                  (1 <<
+                                   LINEAR_ADDITIONAL_PRECISION));
                       }
                   }
 
-                  for (size_t i = 0;
-                       i < OUTPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      ++i) {
 
                       biases_[i] =
                           reader.ReadWeight<int32_t>(
                               ACTIVATION_SCALE *
                               WEIGHT_SCALE *
-                              (1 << LINEAR_ADDITIONAL_PRECISION));
+                              (1 <<
+                               LINEAR_ADDITIONAL_PRECISION));
                   }
 
-                  for (size_t i = 0; i < 256; ++i) {
+                  for (
+                      size_t i = 0;
+                      i < 256;
+                      ++i) {
 
-                      for (size_t j = 0; j < 8; ++j)
+                      for (
+                          size_t j = 0;
+                          j < 8;
+                          ++j) {
+
                           lookup_indices_[i][j] = 0;
+                      }
 
                       uint64_t bits = i;
                       uint64_t k = 0;
@@ -521,7 +706,8 @@ jobs:
                       while (bits > 0) {
 
                           lookup_indices_[i][k++] =
-                              q_util::ExtractLowestBit(bits);
+                              q_util::ExtractLowestBit(
+                                  bits);
                       }
                   }
               }
@@ -530,17 +716,21 @@ jobs:
                   const int8_t* src,
                   int32_t* dest) {
 
-                  for (size_t output = 0;
-                       output < OUTPUT_SIZE;
-                       ++output) {
+                  for (
+                      size_t output = 0;
+                      output < OUTPUT_SIZE;
+                      ++output) {
 
-                      int32_t sum = biases_[output];
+                      int32_t sum =
+                          biases_[output];
 
-                      for (size_t input = 0;
-                           input < INPUT_SIZE;
-                           ++input) {
+                      for (
+                          size_t input = 0;
+                          input < INPUT_SIZE;
+                          ++input) {
 
-                          const int8_t value = src[input];
+                          const int8_t value =
+                              src[input];
 
                           if (value == 0)
                               continue;
@@ -553,13 +743,15 @@ jobs:
                                       input));
 
                           sum +=
-                              static_cast<int32_t>(value) *
+                              static_cast<int32_t>(
+                                  value) *
                               static_cast<int32_t>(
                                   weights_[index]);
                       }
 
                       dest[output] =
-                          sum >> LINEAR_ADDITIONAL_PRECISION;
+                          sum >>
+                          LINEAR_ADDITIONAL_PRECISION;
                   }
               }
 
@@ -584,7 +776,10 @@ jobs:
               > weights_;
 
               alignas(64)
-              std::array<int32_t, OUTPUT_SIZE> biases_;
+              std::array<
+                  int32_t,
+                  OUTPUT_SIZE
+              > biases_;
 
               alignas(64)
               std::array<
@@ -596,26 +791,32 @@ jobs:
           template <size_t INPUT_SIZE, size_t OUTPUT_SIZE>
           struct PreciseLinearLayer {
 
-              void Initialize(ModelReader& reader) {
+              void Initialize(
+                  ModelReader& reader) {
 
-                  for (size_t i = 0;
-                       i < INPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      ++i) {
 
-                      for (size_t j = 0;
-                           j < OUTPUT_SIZE;
-                           ++j) {
+                      for (
+                          size_t j = 0;
+                          j < OUTPUT_SIZE;
+                          ++j) {
 
-                          weights_[j * INPUT_SIZE + i] =
+                          weights_[
+                              j * INPUT_SIZE + i
+                          ] =
                               reader.ReadWeight<int16_t>(
                                   WEIGHT_SCALE *
                                   PRECISE_WEIGHT_SCALE);
                       }
                   }
 
-                  for (size_t i = 0;
-                       i < OUTPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < OUTPUT_SIZE;
+                      ++i) {
 
                       biases_[i] =
                           reader.ReadWeight<int32_t>(
@@ -630,22 +831,26 @@ jobs:
                   const int16_t* input,
                   int32_t* output) {
 
-                  for (size_t out = 0;
-                       out < OUTPUT_SIZE;
-                       ++out) {
+                  for (
+                      size_t out = 0;
+                      out < OUTPUT_SIZE;
+                      ++out) {
 
-                      int32_t sum = biases_[out];
+                      int32_t sum =
+                          biases_[out];
 
-                      for (size_t in = 0;
-                           in < INPUT_SIZE;
-                           ++in) {
+                      for (
+                          size_t in = 0;
+                          in < INPUT_SIZE;
+                          ++in) {
 
                           sum +=
                               static_cast<int32_t>(
                                   input[in]) *
                               static_cast<int32_t>(
                                   weights_[
-                                      out * INPUT_SIZE + in]);
+                                      out * INPUT_SIZE +
+                                      in]);
                       }
 
                       output[out] =
@@ -666,17 +871,22 @@ jobs:
               > weights_;
 
               alignas(64)
-              std::array<int32_t, OUTPUT_SIZE> biases_;
+              std::array<
+                  int32_t,
+                  OUTPUT_SIZE
+              > biases_;
           };
 
           template <size_t INPUT_SIZE>
           struct OutputLayer {
 
-              void Initialize(ModelReader& reader) {
+              void Initialize(
+                  ModelReader& reader) {
 
-                  for (size_t i = 0;
-                       i < INPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      ++i) {
 
                       weights_[i] =
                           reader.ReadWeight<int16_t>(
@@ -696,13 +906,16 @@ jobs:
 
                   int32_t answer = 0;
 
-                  for (size_t i = 0;
-                       i < INPUT_SIZE;
-                       ++i) {
+                  for (
+                      size_t i = 0;
+                      i < INPUT_SIZE;
+                      ++i) {
 
                       answer +=
-                          static_cast<int32_t>(input[i]) *
-                          static_cast<int32_t>(weights_[i]);
+                          static_cast<int32_t>(
+                              input[i]) *
+                          static_cast<int32_t>(
+                              weights_[i]);
                   }
 
                   answer += bias_;
@@ -713,7 +926,10 @@ jobs:
           private:
 
               alignas(64)
-              std::array<int16_t, INPUT_SIZE> weights_;
+              std::array<
+                  int16_t,
+                  INPUT_SIZE
+              > weights_;
 
               int32_t bias_;
           };
@@ -723,10 +939,14 @@ jobs:
               int8_t* output,
               const int16_t* input) {
 
-              for (int i = 0; i < size; ++i) {
+              for (
+                  int i = 0;
+                  i < size;
+                  ++i) {
 
                   int value =
-                      static_cast<int>(input[i]) >>
+                      static_cast<int>(
+                          input[i]) >>
                       FEATURE_ADDITIONAL_PRECISION;
 
                   if (value < 0)
@@ -736,7 +956,8 @@ jobs:
                       value = 127;
 
                   output[i] =
-                      static_cast<int8_t>(value);
+                      static_cast<int8_t>(
+                          value);
               }
           }
 
@@ -750,9 +971,13 @@ jobs:
                   WEIGHT_SCALE /
                   256 - 1;
 
-              for (int i = 0; i < size; ++i) {
+              for (
+                  int i = 0;
+                  i < size;
+                  ++i) {
 
-                  int32_t value = input[i];
+                  int32_t value =
+                      input[i];
 
                   if (value < 0)
                       value = 0;
@@ -761,7 +986,8 @@ jobs:
                       value = upper;
 
                   output[i] =
-                      static_cast<int16_t>(value);
+                      static_cast<int16_t>(
+                          value);
               }
           }
 
@@ -770,11 +996,32 @@ jobs:
           #endif
           EOF
 
-          echo "Portable NNUE layers installed."
+          echo "Portable ARM NNUE layers installed."
 
-      # ------------------------------------------------------------
-      # CMAKE
-      # ------------------------------------------------------------
+      # ============================================================
+      # VERIFY NO AVX/SSE IN LAYERS
+      # ============================================================
+
+      - name: Verify NNUE Layer
+        shell: bash
+        run: |
+          set -e
+
+          echo "Checking layers.h..."
+
+          if grep -nE \
+            "__m256|__m128|_mm256|_mm128|immintrin|avx2|AVX2|SSE" \
+            src/eval/layers.h; then
+
+            echo "ERROR: x86 SIMD remains in layers.h."
+            exit 1
+          fi
+
+          echo "OK: layers.h is portable."
+
+      # ============================================================
+      # CONFIGURE
+      # ============================================================
 
       - name: Configure CMake
         shell: bash
@@ -795,9 +1042,9 @@ jobs:
             -DCMAKE_C_FLAGS="-O3" \
             -DCMAKE_CXX_FLAGS="-O3 -fno-fast-math"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # BUILD
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Build Quirky
         shell: bash
@@ -808,9 +1055,9 @@ jobs:
             --config Release \
             --parallel "$(nproc)"
 
-      # ------------------------------------------------------------
+      # ============================================================
       # FIND BINARY
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Find Quirky Binary
         shell: bash
@@ -856,20 +1103,22 @@ jobs:
             exit 1
           fi
 
-          echo "Binary:"
+          echo
+          echo "Selected binary:"
           echo "$BINARY"
 
           mkdir -p dist/bin
 
-          cp "$BINARY" \
+          cp \
+            "$BINARY" \
             dist/bin/Quirky-android-arm64
 
           chmod +x \
             dist/bin/Quirky-android-arm64
 
-      # ------------------------------------------------------------
-      # VERIFY
-      # ------------------------------------------------------------
+      # ============================================================
+      # ELF CHECK
+      # ============================================================
 
       - name: Verify ELF
         shell: bash
@@ -878,32 +1127,50 @@ jobs:
 
           BINARY="dist/bin/Quirky-android-arm64"
 
+          echo "========================================"
+          echo "FILE"
+          echo "========================================"
+
           file "$BINARY"
 
           echo
+          echo "========================================"
+          echo "ELF HEADER"
+          echo "========================================"
+
           readelf -h "$BINARY" |
             grep -E \
               "Class:|Machine:|Type:|Entry point"
 
           echo
-          echo "Dependencies:"
+          echo "========================================"
+          echo "DEPENDENCIES"
+          echo "========================================"
+
           readelf -d "$BINARY" |
             grep NEEDED ||
             true
 
-      - name: Check Binary For x86 Instructions
+      # ============================================================
+      # FINAL SIMD CHECK
+      # ============================================================
+
+      - name: Check Binary For AVX
         shell: bash
         run: |
           set -e
 
           BINARY="dist/bin/Quirky-android-arm64"
 
-          echo "Checking binary strings..."
+          echo "========================================"
+          echo "AVX CHECK"
+          echo "========================================"
 
           if strings "$BINARY" |
-             grep -Ei \
-               "avx2|avx|ymm|__m256|_mm256"; then
+            grep -Ei \
+              "avx2|avx|ymm|__m256|_mm256"; then
 
+            echo
             echo "WARNING: AVX-related strings detected."
 
           else
@@ -912,9 +1179,9 @@ jobs:
 
           fi
 
-      # ------------------------------------------------------------
+      # ============================================================
       # PACKAGE
-      # ------------------------------------------------------------
+      # ============================================================
 
       - name: Package
         shell: bash
@@ -935,6 +1202,10 @@ jobs:
             dist/quirky-android-arm64.tar.gz \
             -C dist/package \
             .
+
+      # ============================================================
+      # ARTIFACT
+      # ============================================================
 
       - name: Upload Android ARM64
         uses: actions/upload-artifact@v4
