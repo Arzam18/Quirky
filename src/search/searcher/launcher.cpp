@@ -1,5 +1,6 @@
 #include "launcher.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 
@@ -42,7 +43,7 @@ void SearchLauncher::Start(const q_core::Board& board, const std::vector<q_core:
     Join();
     control_.Reset();
     tt_.NextPosition();
-    thread_ = std::thread([this, board, moves, time_control, max_depth]() {
+    thread_ = LargeStackThread([this, board, moves, time_control, max_depth]() {
         StartMainThread(board, moves, time_control, max_depth);
     });
 }
@@ -136,9 +137,12 @@ void SearchLauncher::StartMainThread(q_core::Board board, const std::vector<q_co
     }
 
     SearchStat stat;
-    Searcher searcher(tt_, rt, board, control_, stat);
+    auto searcher =
+        std::make_unique<Searcher>(
+            tt_, rt, board, control_, stat);
     SearchTimer timer(time_control, board, stat);
-    std::thread search_thread = std::thread([&]() { searcher.Run(max_depth, real_pv_count); });
+    LargeStackThread search_thread(
+        [&]() { searcher->Run(max_depth, real_pv_count); });
 
     SearchResult final_result{};
     final_result.depth = 0;
