@@ -1,7 +1,7 @@
 #ifndef QUIRKY_SRC_SEARCH_SEARCHER_LAUNCHER_H
 #define QUIRKY_SRC_SEARCH_SEARCHER_LAUNCHER_H
 
-#include <thread>
+#include "util/large_stack_thread.h"
 
 #include "search/control/control.h"
 #include "search/control/time.h"
@@ -25,7 +25,7 @@ class SearchLauncher {
     void StartMainThread(q_core::Board board, const std::vector<q_core::Move>& moves,
                          time_control_t time_control, depth_t max_depth);
     static constexpr uint8_t TT_DEFAULT_BYTE_SIZE_LOG = 25;
-    std::thread thread_;
+    LargeStackThread thread_;
     q_search::TranspositionTable tt_{TT_DEFAULT_BYTE_SIZE_LOG};
     SearchControl control_;
     size_t pv_count_ = 1;
