@@ -1,5 +1,7 @@
 #include "searcher.h"
 
+#include <algorithm>
+
 #include <cmath>
 #include <cstddef>
 
