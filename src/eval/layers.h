@@ -1,6 +1,15 @@
 #ifndef QUIRKY_SRC_EVAL_LAYERS_H
 #define QUIRKY_SRC_EVAL_LAYERS_H
 
+// Quirky NNUE layers.
+//
+// ARM64 uses the native NEON implementation in layers_neon.h.
+// Other architectures keep the original AVX2 implementation below.
+
+#if defined(__aarch64__) || defined(__arm64__)
+#include "layers_neon.h"
+#else
+
 // Code is inherited from:
 // https://github.com/official-stockfish/nnue-pytorch/blob/master/docs/nnue.md
 // https://github.com/jhonnold/berserk/blob/main/src/nn/evaluate.c
@@ -448,4 +457,6 @@ inline void ClippedReLU32(int size, int16_t* output, const int32_t* input) {
 
 }  // namespace q_eval
 
-#endif  // QUIRKY_SRC_EVAL_MODEL_H
+#endif  // ARM64 / original implementation
+
+#endif  // QUIRKY_SRC_EVAL_LAYERS_H
