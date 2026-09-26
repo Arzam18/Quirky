@@ -1,7 +1,7 @@
 #ifndef QUIRKY_SRC_UTIL_BIT_H
 #define QUIRKY_SRC_UTIL_BIT_H
 
-#ifndef NO_AVX2
+#if !defined(__aarch64__) && !defined(__arm64__) && !defined(NO_AVX2)
 #include <immintrin.h>
 #endif
 
@@ -78,7 +78,7 @@ inline constexpr uint64_t ScatterByte(const uint8_t num) {
     return ans;
 }
 
-#ifndef NO_AVX2
+#if !defined(__aarch64__) && !defined(__arm64__) && !defined(NO_AVX2)
 inline uint64_t DepositBits(const uint64_t submask, const uint64_t mask) {
     return _pdep_u64(submask, mask);
 }
@@ -87,6 +87,7 @@ inline uint64_t ExtractBits(const uint64_t mask, const uint64_t submask) {
     return _pext_u64(mask, submask);
 }
 #else
+// ARM64 and NO_AVX2 use the portable implementation.
 inline uint64_t DepositBits(uint64_t src, uint64_t mask) {
     uint64_t result = 0;
     int src_pos = 0;
