@@ -2,7 +2,14 @@ cmake_minimum_required(VERSION 3.18)
 project(Quirky)
 
 set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2 -msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt")
+
+# Quirky has native x86/AVX2 code and now also has a native ARM64/NEON
+# implementation. Do not pass x86 ISA flags to an ARM compiler.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")
+
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt")
+endif()
 
 add_compile_options(
     -Wall -Wextra -Wpedantic
@@ -11,12 +18,16 @@ add_compile_options(
     -Werror
 )
 
-option (NO_AVX2 OFF)
-if(NO_AVX2)
-    MESSAGE(STATUS "BMI2 AND AVX2 is off")
+option(NO_AVX2 OFF)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    message(STATUS "ARM64 detected: using native ARM NEON NNUE implementation")
+    add_definitions(-DQUIRKY_ARM_NEON=1)
+elseif(NO_AVX2)
+    message(STATUS "BMI2 AND AVX2 is off")
     add_definitions(-DNO_AVX2=1)
 else()
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mavx2 -mbmi -mbmi2")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mavx2 -mbmi -mbmi2")
 endif()
 
 include(CheckIPOSupported)
@@ -32,7 +43,7 @@ include_directories("${PROJECT_BINARY_DIR}")
 include_directories(src)
 
 add_custom_command(
-    COMMAND ${PROJECT_SOURCE_DIR}/src/incbin/embed.py --input ${PROJECT_SOURCE_DIR}/src/incbin/model.qnne --output ${PROJECT_BINARY_DIR}/model_weights.h
+    COMMAND python3 ${PROJECT_SOURCE_DIR}/src/incbin/embed.py --input ${PROJECT_SOURCE_DIR}/src/incbin/model.qnne --output ${PROJECT_BINARY_DIR}/model_weights.h
     DEPENDS ${PROJECT_SOURCE_DIR}/src/incbin/embed.py  ${PROJECT_SOURCE_DIR}/src/incbin/model.qnne
     OUTPUT ${PROJECT_BINARY_DIR}/model_weights.h
 )
