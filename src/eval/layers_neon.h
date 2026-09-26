@@ -217,15 +217,10 @@ struct NeonI16x16 {
 // first sums pairs into signed int16 lanes. Those pair sums cannot
 // overflow int16 for activation values [0,127] and int8 weights.
 static inline NeonI16x16 Maddubs8(int32x4_t a,
-                                   const int8_t* b) {
+                                   int8x16_t b0,
+                                   int8x16_t b1) {
     const int8x16_t aa =
         vreinterpretq_s8_s32(a);
-
-    const int8x16_t b0 =
-        vld1q_s8(b);
-
-    const int8x16_t b1 =
-        vld1q_s8(b + 16);
 
     // Each vmull produces the byte products for one 128-bit half.
     // vpadd then performs the adjacent pair sums that
@@ -330,7 +325,6 @@ struct LinearLayer {
 
     void Process(const int8_t* src, int32_t* dest) {
         constexpr size_t SPARSE_CHUNK_SIZE = 4;
-        constexpr size_t IN_WIDTH = 4;
         constexpr size_t NUM_CHUNKS =
             INPUT_SIZE / SPARSE_CHUNK_SIZE;
         constexpr size_t OUT_CC =
