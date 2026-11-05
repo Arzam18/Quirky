@@ -30,6 +30,9 @@ void Position::UnmakeMove(const q_core::Move move, const q_core::MakeMoveInfo& m
 }
 
 bool Position::MakeMove(const q_core::Move move, q_core::MakeMoveInfo& make_move_info) {
+    if (!HasBufferSpace()) {
+        return false;
+    }
     q_core::MakeMove(board, move, make_move_info);
     if (!q_core::WasMoveLegal(board, move)) {
         q_core::UnmakeMove(board, move, make_move_info);
@@ -42,6 +45,9 @@ bool Position::MakeMove(const q_core::Move move, q_core::MakeMoveInfo& make_move
 
 bool Position::MakeMove(q_core::Move move, q_core::MakeMoveInfo& make_move_info,
                         const std::function<void()>& after_board_change) {
+    if (!HasBufferSpace()) {
+        return false;
+    }
     q_core::MakeMove(board, move, make_move_info);
     if (!q_core::WasMoveLegal(board, move)) {
         q_core::UnmakeMove(board, move, make_move_info);

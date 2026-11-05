@@ -26,7 +26,14 @@ struct Position {
 
     ~Position();
 
-    static constexpr size_t MAX_BUFFER_SIZE = 256;
+    // Search can exceed nominal depth through singular extensions, and
+    // quiescence search may add further check/evasion plies. Keep more
+    // evaluator states than the nominal depth requires.
+    static constexpr size_t MAX_BUFFER_SIZE = 512;
+
+    bool HasBufferSpace() const noexcept {
+        return buffer_head_ + 1 < MAX_BUFFER_SIZE;
+    }
 
     bool MakeMove(q_core::Move move, q_core::MakeMoveInfo& make_move_info);
     bool MakeMove(q_core::Move move, q_core::MakeMoveInfo& make_move_info,
