@@ -19,7 +19,9 @@ class Searcher {
              SearchControl& control, SearchStat& stat);
     void Run(depth_t max_depth, size_t pv_count);
 
-    static constexpr depth_t MAX_DEPTH = (Position::MAX_BUFFER_SIZE - 1) / 2;
+    // Preserve the upstream nominal search-depth limit. MAX_BUFFER_SIZE
+    // is deliberately larger to cover singular extensions and qsearch plies.
+    static constexpr depth_t MAX_DEPTH = 127;
 
   private:
     enum class NodeType { Root, PV, Simple };
@@ -33,6 +35,8 @@ class Searcher {
     std::vector<q_core::Move> GetPV(q_core::Move best_move);
     bool ShouldStop();
 
+    // local_context_ is indexed by idepth. Search() stops before this
+    // sentinel index, so the valid range is [0, MAX_IDEPTH).
     static constexpr idepth_t MAX_IDEPTH = Position::MAX_BUFFER_SIZE - 1;
     struct GlobalContext {
         HistoryTable history_table;

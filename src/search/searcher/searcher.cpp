@@ -20,7 +20,6 @@ namespace q_search {
 Searcher::Searcher(TranspositionTable& tt, RepetitionTable& rt, const q_core::Board& board,
                    SearchControl& control, SearchStat& stat)
     : tt_(tt), rt_(rt), position_(board), control_(control), stat_(stat) {
-    global_context_.history_table = HistoryTable();
     global_context_.best_move = q_core::NULL_MOVE;
     for (size_t i = 0; i < MAX_IDEPTH; i++) {
         local_context_[i] = LocalContext();
@@ -182,6 +181,11 @@ inline static constexpr int16_t QS_SEE_PRUNING_THRESHOLD = -20;
 
 q_eval::score_t Searcher::QuiescenseSearch(q_eval::score_t alpha, q_eval::score_t beta) {
     CHECK_STOP;
+    // Check evasions can recurse without reducing nominal search depth.
+    // Stop safely before the evaluator-state history buffer is exhausted.
+    if (!position_.HasBufferSpace()) {
+        return position_.GetEvaluatorScore();
+    }
     stat_.IncNodesCount();
 
     bool in_check = position_.IsCheck();
@@ -313,6 +317,12 @@ template <Searcher::NodeType node_type>
 q_eval::score_t Searcher::Search(depth_t depth, idepth_t idepth, q_eval::score_t alpha,
                                  q_eval::score_t beta, bool is_cut_node) {
     CHECK_STOP;
+
+    // Singular extensions can make the actual ply exceed twice the
+    // nominal depth. Keep the rare extreme branch inside both backing arrays.
+    if (idepth >= MAX_IDEPTH || !position_.HasBufferSpace()) {
+        return position_.GetEvaluatorScore();
+    }
 
     // Checking fifty move rule
     if (position_.board.fifty_rule_move_count >= FIFTY_MOVES_RULE_LIMIT) {
