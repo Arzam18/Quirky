@@ -3,11 +3,19 @@ project(Quirky)
 
 set(CMAKE_CXX_STANDARD 20)
 
-# Quirky has native x86/AVX2 code and now also has a native ARM64/NEON
-# implementation. Do not pass x86 ISA flags to an ARM compiler.
+# Quirky has native x86/AVX2 code and a native ARM64/NEON NNUE path.
+# Android's toolchain identifies the target by ABI; honor that even if a
+# CMake version reports a generic CMAKE_SYSTEM_PROCESSOR value.
+set(QUIRKY_TARGET_ARM64 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$" OR
+   CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a" OR
+   ANDROID_ABI STREQUAL "arm64-v8a")
+    set(QUIRKY_TARGET_ARM64 ON)
+endif()
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -O2")
 
-if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+if(NOT QUIRKY_TARGET_ARM64)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -msse -msse2 -msse3 -mssse3 -msse4.1 -msse4.2 -mpopcnt")
 endif()
 
@@ -20,7 +28,7 @@ add_compile_options(
 
 option(NO_AVX2 OFF)
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+if(QUIRKY_TARGET_ARM64)
     message(STATUS "ARM64 detected: using native ARM NEON NNUE implementation")
     add_definitions(-DQUIRKY_ARM_NEON=1)
 elseif(NO_AVX2)
